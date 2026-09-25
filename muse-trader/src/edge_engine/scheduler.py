@@ -5,8 +5,11 @@ import argparse
 import asyncio
 import logging
 import os
+from datetime import datetime, timezone
 
 from .config import load_settings
+from .domain.log import QuoteLog
+from .domain.quotes import snapshot_to_quote
 from .engine.ev import evaluate
 from .execution.broker import make_broker
 from .notifier.discord import DiscordNotifier
@@ -25,16 +28,24 @@ MAPPING: dict[str, dict[str, str]] = {
 }
 
 
-async def tick(settings, notifier, broker, store, bankroll: float) -> None:
+async def tick(settings, notifier, broker, store, quote_log, bankroll: float) -> None:
     eng = settings.engine
     kalshi = await KalshiPoller().poll()
     poly = await PolymarketGammaPoller().poll()
     log.info("polled %d kalshi, %d polymarket markets", len(kalshi), len(poly))
 
+    # Append-only quote log: every observed price lands here, mapped or not.
+    # Canonical market linking comes from the mapper in a later phase.
+    now = datetime.now(timezone.utc)
+    for snap in kalshi + poly:
+        quote_log.append(snapshot_to_quote(snap, None, now))
+
     odds_key = os.environ.get("ODDS_API_KEY", "")
     fair: dict[str, float] = {}
     if odds_key:
         books = await OddsApiPoller(odds_key).poll()
+        for snap in books:
+            quote_log.append(snapshot_to_quote(snap, None, now))
         fair = fair_from_snapshots(
             books,
             method=settings.pricing.devig_method,
@@ -101,12 +112,13 @@ async def main() -> None:
     ) if webhook else None
     broker = make_broker(settings.execution.mode, live_flag=args.live)
     store = StateStore()
+    quote_log = QuoteLog()
 
     log.info("starting edge-engine mode=%s bankroll=%.2f",
              settings.execution.mode, args.bankroll)
     while True:
         try:
-            await tick(settings, notifier, broker, store, args.bankroll)
+            await tick(settings, notifier, broker, store, quote_log, args.bankroll)
         except Exception:  # noqa: BLE001 - one bad tick must not kill the loop
             log.exception("tick failed")
         if args.once:
