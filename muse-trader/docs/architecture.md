@@ -1,113 +1,74 @@
 # Architecture
 
-## Data flow
+## Layers
 
 ```
-pollers (Kalshi, Polymarket Gamma/CLOB, The Odds API)
-        |
-        v
-normalizer -> MarketSnapshot(event_key, outcomes, prices, ts, venue)
-        |
-        v
-market mapper -> links snapshots of the same proposition (mapping table +
-                 fuzzy match, manual override; unmapped = priced only)
-        |
-        v
-pricing engine -> de-vig each reference book -> weighted consensus fair prob
-        |
-        v
-EV engine -> edge = |fair - market| - fees - slippage
-           -> fractional Kelly sizing, caps, daily loss limit
-           -> Signal(market, side, price, fair, edge, ev, stake)
-        |
-        +--> notifier -> Discord webhook (dedup + cooldown)
-        |
-        +--> execution adapter -> dry-run | paper | live (explicit only)
-        |
-        v
-state store -> signals, alerts, fills (SQLite local / DynamoDB on AWS)
+adapters/      implements ports: Kalshi, Polymarket, The Odds API,
+               listing registry, SQLite store, Discord, execution
+application/   use cases + ports: pricing, detection, risk, service loop
+domain/        pure model (stdlib only): outcomes, terms, quotes,
+               fees, fair value, combos
 ```
 
-## Components
+Dependencies point inward: adapters -> application -> domain. Venue formats
+never leak past an adapter: every venue market is translated into canonical
+`Outcome`s (via the builders in `domain/propositions.py`) and `Terms` before
+the application ever sees it.
 
-- **Pollers** (`pollers/`): one class per venue implementing `Poller.poll()`.
-  Independent asyncio tasks with per-venue intervals and jitter. Failures are
-  caught per poller and counted as metrics, never fatal.
-- **Pricing** (`pricing/`): odds-format conversion, de-vigging (additive,
-  multiplicative, power), book consensus with sharp weighting.
-- **Engine** (`engine/`): EV per contract, edge threshold, fractional Kelly,
-  signal construction and dedup keys.
-- **Notifier** (`notifier/discord.py`): webhook POST with embeds, 429 backoff,
-  per-market cooldown.
-- **Execution** (`execution/broker.py`): `Broker` interface. `DryRunBroker`
-  logs. `PaperBroker` simulates fills at quote and tracks P&L.
-  `KalshiBroker` / `PolymarketBroker` are stubs until auth is wired; live
-  requires `execution.mode: live` plus a runtime confirmation flag.
-- **Storage** (`storage/state.py`): SQLite locally; the schema mirrors what
-  DynamoDB will hold (signals, alerts, fills keyed by market+side+ts).
-- **Scheduler** (`scheduler.py`): the main loop. One tick = poll all, map,
-  price, evaluate, notify, execute. Configurable cadence per venue.
+## Tick flow
 
-## Domain model (`domain/`)
+```
+OddsApiSource.priced_outcomes()      sportsbook prices -> PricedOutcome
+        |
+WeightedConsensusModel.value()       devig per book-market, weight books
+        |                            -> dict[Outcome, FairValue]
+KalshiExchange / PolymarketExchange  order books for registered listings
+        |
+RegistryResolver                     ticker -> Listing (explicit table);
+                                     unknown -> review queue, never traded
+        |
+ValueDetector.detect()               net-edge gate + fractional Kelly +
+                                     uncertainty shrink + depth cap
+        |
+ExposureLimits -> Discord -> execution (dry-run | paper | live-fails-closed)
+```
 
-The foundation everything downstream stands on. Venue data is never trusted
-directly: it is normalized into domain objects, linked to a canonical market
-through the mapper, and only then priced or traded.
+## Key design points
 
-- **CanonicalEvent / CanonicalMarket / Outcome** (`events.py`, `markets.py`):
-  one real-world event (a game), one proposition about it (Chiefs moneyline),
-  and the list of outcomes with optional lines. Market types include
-  moneyline, spread, total, prop, and combo (with `combo_legs` pointing at
-  the canonical leg markets, the home of the correlation detectors later).
-- **SettlementRules** (`settlement.py`): first-class, not an afterthought.
-  Overtime, DNP voids, stat-correction windows, postponement rules, and the
-  rule source are data, with a SHA fingerprint. Two markets are only
-  comparable when fingerprints match or an explicit equivalence is
-  registered.
-- **MarketMapper** (`mapping.py`): entity resolution across venues. Explicit
-  registration is the source of truth; `suggest()` ranks candidates for
-  human confirmation when bootstrapping. `resolve()` never guesses: unknown
-  ids return None, and a venue quote whose settlement fingerprint changed
-  under us is quarantined (priced, never signaled) and recorded in
-  `mismatches`. This is the trap from the research made impossible by
-  construction: a "different bet wearing a similar name" cannot reach the
-  EV engine.
-- **Quote / QuoteLog** (`quotes.py`, `log.py`): bitemporal, append-only.
-  Every observed price keeps `valid_at` (when it was valid at the venue) and
-  `observed_at` (when we saw it); the gap is the latency the stale-quote
-  detectors will trade against. `as_of(ts)` answers "what did we know at
-  time T", which makes backtests honest and enables closing line value:
-  our fill price vs the sharp consensus at close. The scheduler already
-  appends every polled snapshot; canonical linking arrives with the mapper
-  integration.
-- **MarketBook** (`quotes.py`): order-book levels with `avg_fill_price()`,
-  which walks the ladder. Depth-aware sizing plugs in here: a 4% edge on
-  the first $200 that is 0% by $2,000 must size against the ladder, not
-  top of book.
-- **FairValue** (`fairvalue.py`): consensus probability plus a confidence
-  score blending sharp-book weight share, book breadth, cross-book
-  agreement, and time to event. Confidence gates thresholds and sizing
-  downstream instead of living only in a log line.
+- **Canonical outcomes.** "KC -3", "KC wins by more than 3.5", and
+  "BUF +3.5" all reduce to thresholds on home-minus-away margin with integer
+  normal form, so equality means "same outcome". Settlement differences
+  (push refunds, listed pitchers, voids) live in `Terms`, separate from the
+  outcome. Two listings are the same bet only when both match.
+- **Net-edge gating.** The threshold applies to gross edge minus
+  per-contract taker fee minus slippage, widened by fair-value uncertainty.
+  A flat gross-edge threshold is wrong because Kalshi-style fees peak at 50c.
+- **Two-pass sizing.** Size tentatively on gross edge to learn the contract
+  count (which sets the per-contract fee under per-order round-up), gate on
+  net edge, then size finally on net edge, shrunk by uncertainty and capped
+  by order-book depth. The final edge is computed at the fill's average
+  price, not the top of the book.
+- **Bitemporal observations.** Every quote carries `valid_at` (true at the
+  venue) and `recorded_at` (seen by us). The store is append-only; `as_of`
+  reconstructs what we knew at any moment for honest backtests and CLV.
+- **Fail-closed execution.** Live brokers raise until their order paths are
+  implemented, eligibility is verified (notably NY for Kalshi sports
+  contracts and US geo-blocking for Polymarket Global), and live trading is
+  explicitly authorized.
 
-## AWS deployment (target)
+## Current state
 
-- Docker image -> Amazon ECR.
-- Long-running **ECS Fargate service** (0.25 vCPU / 0.5 GB), internal asyncio
-  loop. Desired count 1; health check + CloudWatch alarm restarts it.
-- Secrets (Kalshi key id, Polymarket creds, Odds API key, Discord webhook) in
-  **Secrets Manager**, injected via the task definition. Least-privilege task
-  roles.
-- **DynamoDB** on-demand tables: `signals`, `alerts`, `fills`.
-- **EventBridge Scheduler** for batch jobs (daily P&L summary, mapping refresh).
-- **CloudWatch Logs** via awslogs; alarms on task stopped / error rate / no
-  signals for N hours (stale-data detector).
-- Cost: Fargate small task is a few dollars a month; the usual cost driver is
-  NAT Gateway (~$30+/mo), so prefer public subnets with `assignPublicIp` for
-  v1 or VPC endpoints for Secrets Manager/DynamoDB.
-- See `infra/aws/README.md` for the concrete steps.
+Working: domain model, pricing (additive/multiplicative/power devig),
+fee-aware detection, listing registry with terms-change quarantine, SQLite
+store, Discord notifier, dry-run/paper execution, service loop.
 
-## Local dev
+Not yet: Shin devig, combo/correlation detection, ladder-consistency
+detectors, settlement feeds (daily loss limits need them), maker execution
+(cancellation/inventory controls), DynamoDB/AWS deployment, closing-price
+capture and CLV reporting.
 
-`docker compose` is optional; plain `python -m edge_engine.scheduler` with
-SQLite works. Paper mode replays recorded fixtures so the EV engine can be
-tested without venue access.
+## Decisions
+
+Significant decisions are recorded as ADRs in `docs/adr/`. The betting
+principles in `docs/principles.md` are the standard every change is checked
+against; proposals that conflict get challenged before they get built.
