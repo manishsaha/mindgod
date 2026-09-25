@@ -78,14 +78,26 @@ take one-sided +EV positions on exchanges.
 - Live in-game trading is deferred until our latency has been measured against
   the market makers'.
 
-## 8. Speed is measured, then engineered
+## 8. Current phase: alerts first, graded honestly
+
+- The product is the call, not the execution. The user takes calls by hand;
+  every call is tracked on paper and graded (ADR-0008).
+- Paper fills model human reaction time. A paper result the user could not
+  have achieved is worse than no result.
+- Target edges that last minutes. Edges that close in seconds wait for the
+  Automatic tier, which is enabled per edge type only when graded decay data
+  justifies it.
+- A fake edge is worse than a missed one. When in doubt (stale consensus,
+  unproven terms, pitcher news), suppress the alert.
+
+## 9. Speed is measured, then engineered
 
 - Latency is dominated by network and feed delay, not CPU. Use streaming over
   polling wherever a venue offers it, run close to the venues, and measure feed
   latency per venue continuously.
 - Humans are not in the critical path for fleeting edges (ADR-0003).
 
-## 9. Data discipline
+## 10. Data discipline
 
 - Quotes are immutable, append-only facts with two timestamps (when valid at the
   venue, when we recorded them). We can always reconstruct what we knew at any
