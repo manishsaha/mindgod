@@ -201,3 +201,31 @@ class KalshiExchange(ExchangeSource):
             for m in markets
             if m.get("ticker")
         ]
+
+    async def market_results(self, tickers: list[str]) -> dict[str, str | None]:
+        """Fetch settlement results for Kalshi markets.
+
+        Returns dict mapping ticker -> result ("yes", "no", None if not settled).
+        Uses the public /markets/{ticker} endpoint.
+        """
+        results: dict[str, str | None] = {}
+        try:
+            async with httpx.AsyncClient(base_url=BASE, timeout=15) as client:
+                for ticker in tickers:
+                    try:
+                        resp = await client.get(f"/markets/{ticker}")
+                        resp.raise_for_status()
+                        data = resp.json().get("market", {})
+                        # Kalshi returns "result" as "yes" or "no" when settled,
+                        # empty string or missing when not settled.
+                        result = data.get("result")
+                        if result in ("yes", "no"):
+                            results[ticker] = result
+                        else:
+                            results[ticker] = None
+                    except Exception:
+                        log.exception("failed to fetch result for %s", ticker)
+                        results[ticker] = None
+        except Exception:
+            log.exception("kalshi market results fetch failed")
+        return results

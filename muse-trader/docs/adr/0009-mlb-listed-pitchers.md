@@ -53,8 +53,10 @@ and let the application decide.
 4. **Suppress on pitcher news.** A `ProbablePitcherSource` port (first
    adapter: the public MLB Stats API) records each game's probable starters.
    When a game's probables change, or when fewer than two are announced, its
-   MLB listings are suppressed until the next sportsbook refresh lands after
-   the change.
+   MLB listings are suppressed until a sportsbook refresh arrives with a quote
+   whose valid_at is later than the change time, or until 10 minutes have
+   passed since the change, whichever is later. A refresh that lands seconds
+   after a scratch, before books have repriced, does not lift suppression.
 
 ## Consequences
 

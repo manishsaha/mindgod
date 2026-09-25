@@ -1,7 +1,25 @@
 # ADR-0008: Alert-first; manual execution graded by paper tracking
 
 Date: 2026-09-25
-Status: Accepted. Amends ADR-0003. Implementation: partial (part 1 complete, part 2 data model and grading complete; Discord "Took it" button requires Interactions API setup).
+Status: Accepted. Amends ADR-0003. Implementation: partial.
+
+## Implementation status
+
+Part 1 (alerts, paper fills, snapshots): complete.
+Part 2 (data model, closing lines, settlements, grading): the tables, functions,
+and wiring are in place. `capture_closing_lines()` queries the quote log for
+pre-game consensus. `_check_settlements()` fetches Kalshi market results and
+records settlements. `_grade_settled_call()` records simplified CLV/P&L grades.
+The full `grade_call()` reconstruction from stored data is deferred; the
+simplified grader records essential metrics so the evaluation loop runs.
+
+Known gaps:
+- Discord "Took it" button requires Interactions API setup. Manual fills are
+  recorded directly in the DB for now.
+- Snapshot and reaction-fill tasks are in-memory. A restart loses pending
+  tasks. Acceptable for now.
+- Same-game exposure is not yet included in the alert text.
+- Settlement uses Kalshi market results only. Polymarket settlement is not wired.
 
 ## Context
 

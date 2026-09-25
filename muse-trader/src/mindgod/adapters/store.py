@@ -345,6 +345,31 @@ class Store(ObservationStore):
         )
         self._conn.commit()
 
+    def latest_quotes_before(
+        self, outcome_key: str, before: datetime
+    ) -> list[tuple[str, float, str]]:
+        """Get the latest quote per venue for an outcome with valid_at before the given time.
+
+        Returns list of (venue, price, valid_at) tuples. Used for closing-line
+        capture: the last pre-game consensus, not in-game prices.
+        """
+        rows = self._conn.execute(
+            """SELECT venue, price, valid_at, MAX(recorded_at)
+               FROM observations
+               WHERE kind = 'quote' AND outcome = ? AND valid_at < ?
+               GROUP BY venue""",
+            (outcome_key, before.isoformat()),
+        ).fetchall()
+        return [(r[0], r[1], r[2]) for r in rows]
+
+    def has_closing_line(self, outcome_key: str) -> bool:
+        """Check if a closing line has already been captured for an outcome."""
+        row = self._conn.execute(
+            "SELECT 1 FROM closing_lines WHERE outcome_key = ? LIMIT 1",
+            (outcome_key,),
+        ).fetchone()
+        return row is not None
+
     def record_settlement(self, settlement: Settlement) -> None:
         self._conn.execute(
             "INSERT INTO settlements (outcome_key, result, settled_at) VALUES (?, ?, ?)",
@@ -373,6 +398,113 @@ class Store(ObservationStore):
             ),
         )
         self._conn.commit()
+
+    def unsettled_calls(self) -> list[tuple[str, str, str, str]]:
+        """Get calls that need settlement: (call_id, market_id, side, outcome_key)."""
+        rows = self._conn.execute(
+            """SELECT c.call_id, c.market_id, c.side, c.outcome_key
+               FROM calls c
+               LEFT JOIN settlements s ON c.outcome_key = s.outcome_key
+               WHERE s.outcome_key IS NULL""",
+        ).fetchall()
+        return [(r[0], r[1], r[2], r[3]) for r in rows]
+
+    def get_call(self, call_id: str) -> dict[str, Any] | None:
+        """Fetch a call by ID for grading."""
+        row = self._conn.execute(
+            "SELECT call_id, created_at, venue, market_id, side, outcome, fair_prob,"
+            " fair_se, fair_method, limit_price_x, contracts_n, ask_at_alert,"
+            " outcome_key FROM calls WHERE call_id = ?",
+            (call_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "call_id": row[0],
+            "created_at": row[1],
+            "venue": row[2],
+            "market_id": row[3],
+            "side": row[4],
+            "outcome": row[5],
+            "fair_prob": row[6],
+            "fair_se": row[7],
+            "fair_method": row[8],
+            "limit_price_x": row[9],
+            "contracts_n": row[10],
+            "ask_at_alert": row[11],
+            "outcome_key": row[12],
+        }
+
+    def get_paper_fill(self, call_id: str) -> dict[str, Any] | None:
+        """Fetch the latest paper fill for a call."""
+        row = self._conn.execute(
+            "SELECT fill_id, call_id, filled_at, price, contracts, kind"
+            " FROM paper_fills WHERE call_id = ? ORDER BY filled_at DESC LIMIT 1",
+            (call_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "fill_id": row[0],
+            "call_id": row[1],
+            "filled_at": row[2],
+            "price": row[3],
+            "contracts": row[4],
+            "kind": row[5],
+        }
+
+    def get_manual_fill(self, call_id: str) -> dict[str, Any] | None:
+        """Fetch the manual fill for a call, if any."""
+        row = self._conn.execute(
+            "SELECT fill_id, call_id, filled_at, price, contracts, noted_at"
+            " FROM manual_fills WHERE call_id = ? LIMIT 1",
+            (call_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "fill_id": row[0],
+            "call_id": row[1],
+            "filled_at": row[2],
+            "price": row[3],
+            "contracts": row[4],
+            "noted_at": row[5],
+        }
+
+    def get_snapshots(self, call_id: str) -> list[dict[str, Any]]:
+        """Fetch all snapshots for a call, ordered by time."""
+        rows = self._conn.execute(
+            "SELECT call_id, offset_s, best_ask, best_bid, depth_at_x, recorded_at"
+            " FROM call_snapshots WHERE call_id = ? ORDER BY offset_s",
+            (call_id,),
+        ).fetchall()
+        return [
+            {
+                "call_id": r[0],
+                "offset_s": r[1],
+                "best_ask": r[2],
+                "best_bid": r[3],
+                "depth_at_x": r[4],
+                "recorded_at": r[5],
+            }
+            for r in rows
+        ]
+
+    def get_closing_line(self, outcome_key: str) -> dict[str, Any] | None:
+        """Fetch the closing line for an outcome, if captured."""
+        row = self._conn.execute(
+            "SELECT outcome_key, sharp_close_prob, source, captured_at"
+            " FROM closing_lines WHERE outcome_key = ? LIMIT 1",
+            (outcome_key,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "outcome_key": row[0],
+            "sharp_close_prob": row[1],
+            "source": row[2],
+            "captured_at": row[3],
+        }
 
     def as_of(self, key: str, ts: datetime) -> list[tuple[Any, ...]]:
         """Latest observation rows known at `ts` for one outcome key."""

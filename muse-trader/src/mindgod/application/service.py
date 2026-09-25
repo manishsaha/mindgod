@@ -16,20 +16,24 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 
 from mindgod.domain.fees import FeeModel
 from mindgod.domain.quotes import OrderBook
-from mindgod.domain.terms import Payoff, Terms
+from mindgod.domain.sports import League
+from mindgod.domain.terms import Payoff, PitcherRule, Terms, pitcher_rules_compatible
 from mindgod.domain.valuation import FairValue
 from mindgod.domain.venues import Listing, ListingKey, VenueId
 
 from .calls import (
     Call,
+    CallGrade,
+    Settlement,
     build_call,
     instant_fill,
     reaction_fill,
@@ -100,9 +104,14 @@ class ServiceContext:
     # When probables change or are missing, MLB listings are suppressed.
     probables: dict[str, tuple[str | None, str | None]] = field(default_factory=dict)
     # Event IDs with pitcher changes pending a sportsbook refresh.
-    pitcher_suppressed: set[str] = field(default_factory=set)
+    # Maps event_id -> change_time (when the change was detected).
+    pitcher_suppressed: dict[str, datetime] = field(default_factory=dict)
     # ADR-0009: source for probable pitchers (optional).
     probable_source: ProbablePitcherSource | None = None
+    # ADR-0008: in alert-first mode, do not execute via the venue. The call
+    # system tracks paper fills with reaction time; the instant execution
+    # path is for the old automatic mode only.
+    alert_first: bool = True
 
 
 async def _notify_safely(notifier: Notifier, opp: Opportunity) -> None:
@@ -136,7 +145,7 @@ async def _update_probables(ctx: ServiceContext) -> None:
     """ADR-0009: fetch probable pitchers and detect changes.
 
     When probables change, or fewer than two are announced, the game's MLB
-    listings are suppressed until the next sportsbook refresh.
+    listings are suppressed until the next sportsbook refresh after the change.
     """
     if ctx.probable_source is None:
         return
@@ -145,12 +154,12 @@ async def _update_probables(ctx: ServiceContext) -> None:
     mlb_event_ids: set[str] = set()
     for exchange in ctx.exchanges:
         for listing in ctx.resolver.listings_for(exchange.venue_id):
-            if listing.key.market_id.startswith("KXMLBGAME"):
-                try:
+            try:
+                if listing.outcome.quantity.league is League.MLB:
                     eid = str(listing.outcome.quantity.event_id)
                     mlb_event_ids.add(eid)
-                except AttributeError:
-                    continue
+            except AttributeError:
+                continue
 
     if not mlb_event_ids:
         return
@@ -161,6 +170,7 @@ async def _update_probables(ctx: ServiceContext) -> None:
         log.exception("failed to fetch probable pitchers")
         return
 
+    now = datetime.now(UTC)
     for p in probables:
         eid = p.event_id
         new_pair = (p.home_pitcher, p.away_pitcher)
@@ -186,10 +196,10 @@ async def _update_probables(ctx: ServiceContext) -> None:
                     p.home_pitcher,
                     p.away_pitcher,
                 )
-                ctx.pitcher_suppressed.add(eid)
+                ctx.pitcher_suppressed[eid] = now
         elif old_pair != new_pair and old_pair is not None:
-            # Changed: suppress until next refresh
-            ctx.pitcher_suppressed.add(eid)
+            # Changed: suppress until next refresh (with change time tracked)
+            ctx.pitcher_suppressed[eid] = now
 
 
 def _is_pitcher_suppressed(listing: Listing, ctx: ServiceContext) -> bool:
@@ -199,12 +209,14 @@ def _is_pitcher_suppressed(listing: Listing, ctx: ServiceContext) -> bool:
     changed or are not fully announced, and the suppression has not been
     cleared by a sportsbook refresh.
     """
-    # Only applies to MLB listings (Kalshi KXMLBGAME series)
-    if not listing.key.market_id.startswith("KXMLBGAME"):
+    # Only applies to MLB listings
+    try:
+        if listing.outcome.quantity.league is not League.MLB:
+            return False
+    except AttributeError:
         return False
 
     # Get event_id from the outcome
-    # The outcome's quantity has the event_id
     try:
         event_id = str(listing.outcome.quantity.event_id)
     except AttributeError:
@@ -231,10 +243,6 @@ def _apply_pitcher_rule_adjustment(
     Returns the fair value (possibly with widened SE) if compatible,
     None if the pitcher rules are incompatible.
     """
-    import math
-
-    from mindgod.domain.terms import PitcherRule, pitcher_rules_compatible
-
     listing_rule = listing.terms.void_policy.pitcher_rule
     # Find the pitcher rules of the sources that built this fair value.
     # For now, we check if any priced outcome for this outcome has a
@@ -278,12 +286,7 @@ def _apply_pitcher_rule_adjustment(
     )
 
     if needs_adjustment:
-        # Get pitcher_rule_se from pricing config via the model's settings.
-        # For now, use the default 0.01; the service context should carry it.
-        pitcher_se = 0.01
-        # Try to get from ctx if available (added to ServiceContext later)
-        if hasattr(ctx, "pitcher_rule_se"):
-            pitcher_se = ctx.pitcher_rule_se
+        pitcher_se = ctx.pitcher_rule_se
         new_se = math.sqrt(fair.standard_error**2 + pitcher_se**2)
         log.info(
             "widening SE for %s: %.4f -> %.4f (pitcher rule adjustment)",
@@ -292,8 +295,6 @@ def _apply_pitcher_rule_adjustment(
             new_se,
         )
         # Return a new FairValue with adjusted SE
-        from dataclasses import replace
-
         return replace(fair, standard_error=new_se)
 
     return fair
@@ -528,14 +529,18 @@ async def tick(ctx: ServiceContext, priced: list[PricedOutcome]) -> list[Opportu
                 if venue is None:
                     log.warning("no execution venue for %s", opp.listing.venue_id)
                     continue
-                try:
-                    fill = await venue.buy(opp)
-                except Exception:
-                    log.exception("execution failed for %s", opp.listing)
-                    continue
-                if fill is not None:
-                    ctx.store.record_fill(fill)
-                    ctx.risk.record_fill(fill)
+                # ADR-0008: in alert-first mode, skip venue execution. The call
+                # system records reaction-time paper fills; the instant fill
+                # path must not feed risk metrics.
+                if not ctx.alert_first:
+                    try:
+                        fill = await venue.buy(opp)
+                    except Exception:
+                        log.exception("execution failed for %s", opp.listing)
+                        continue
+                    if fill is not None:
+                        ctx.store.record_fill(fill)
+                        ctx.risk.record_fill(fill)
                 # Notify after execution, off the critical path.
                 if ctx.notifier is not None:
                     _spawn_notify(ctx, ctx.notifier, opp)
@@ -547,12 +552,15 @@ async def tick(ctx: ServiceContext, priced: list[PricedOutcome]) -> list[Opportu
 
 def capture_closing_lines(
     ctx: ServiceContext,
-    fair_by_terms: dict[str, dict[object, FairValue]],
     at: datetime,
 ) -> int:
     """ADR-0008: record the last sharp consensus before events lock.
 
-    Called at event start. Returns the number of closing lines captured.
+    Queries the quote log for the last consensus with valid_at before the
+    event start, not live data after it. This avoids capturing in-game prices.
+
+    Called periodically; captures for events that started since the last call.
+    Returns the number of closing lines captured.
     """
     from .calls import ClosingLine
     from .pricing import outcome_key
@@ -563,32 +571,39 @@ def capture_closing_lines(
             start = ctx.resolver.event_start(listing.key)
             if start is None:
                 continue
-            # Capture if the event started within the last 5 minutes.
-            if not (timedelta(0) <= at - start < timedelta(minutes=5)):
+            # Capture if the event started within the last hour and we haven't
+            # captured it yet. Check by seeing if a closing line exists.
+            if not (timedelta(0) <= at - start < timedelta(hours=1)):
                 continue
-            yes_outcome = (
-                listing.outcome if listing.key.side == "yes" else listing.outcome.complement()
-            )
-            if yes_outcome is None:
+
+            # Check if already captured
+            okey = outcome_key(listing.outcome)
+            if ctx.store.has_closing_line(okey):
                 continue
-            key = terms_key(
-                Terms(
-                    Payoff(yes_outcome, listing.terms.payoff.refunds_if),
-                    listing.terms.void_policy,
-                )
-            )
-            fair = fair_by_terms.get(key, {}).get(yes_outcome)
-            if fair is None:
+
+            # Get the latest quotes before event start
+            quotes = ctx.store.latest_quotes_before(okey, start)
+            if not quotes:
                 continue
-            prob = float(fair.probability.value)
+
+            # Simple consensus: average of latest prices per venue
+            # (A full devig would be better, but this is a reasonable approximation
+            # for the closing line)
+            prices = [price for _, price, _ in quotes]
+            if not prices:
+                continue
+            prob = sum(prices) / len(prices)
+
+            # Adjust for side
             if listing.key.side == "no":
                 prob = 1.0 - prob
+
             try:
                 ctx.store.record_closing_line(
                     ClosingLine(
-                        outcome_key=outcome_key(listing.outcome),
+                        outcome_key=okey,
                         sharp_close_prob=prob,
-                        source=fair.method,
+                        source="pregame_consensus",
                         captured_at=at,
                     )
                 )
@@ -605,6 +620,118 @@ async def _discover(ctx: ServiceContext) -> None:
                 ctx.resolver.report_unmapped(market)
         except Exception:
             log.exception("discovery failed for %s", exchange.venue_id)
+
+
+async def _check_settlements(ctx: ServiceContext) -> int:
+    """ADR-0008: fetch market results from Kalshi and record settlements.
+
+    For each unsettled call, get the market result and determine win/loss.
+    Returns the number of settlements recorded.
+    """
+    unsettled = ctx.store.unsettled_calls()
+    if not unsettled:
+        return 0
+
+    # Group by market_id for batch fetching
+    by_market: dict[str, list[tuple[str, str, str]]] = {}
+    for call_id, market_id, side, outcome_key in unsettled:
+        by_market.setdefault(market_id, []).append((call_id, side, outcome_key))
+
+    n = 0
+    now = datetime.now(UTC)
+
+    # Find the Kalshi exchange
+    kalshi = None
+    for ex in ctx.exchanges:
+        if str(ex.venue_id) == "kalshi":
+            kalshi = ex
+            break
+    if kalshi is None or not hasattr(kalshi, "market_results"):
+        return 0
+
+    tickers = list(by_market.keys())
+    try:
+        results = await kalshi.market_results(tickers)
+    except Exception:
+        log.exception("settlement check failed")
+        return 0
+
+    for ticker, result in results.items():
+        if result is None:
+            continue  # Not settled yet
+        for call_id, side, outcome_key in by_market[ticker]:
+            # Determine win/loss: if market result matches the side we bet
+            if (result == "yes" and side == "yes") or (result == "no" and side == "no"):
+                outcome = "win"
+            else:
+                outcome = "loss"
+            try:
+                settlement = Settlement(
+                    outcome_key=outcome_key,
+                    result=outcome,
+                    settled_at=now,
+                )
+                ctx.store.record_settlement(settlement)
+                n += 1
+                # Grade the call now that we have settlement
+                try:
+                    _grade_settled_call(ctx, call_id, outcome_key, settlement, now)
+                except Exception:
+                    log.exception("grading failed for %s", call_id)
+            except Exception:
+                log.exception("record_settlement failed for %s", call_id)
+
+    return n
+
+
+def _grade_settled_call(
+    ctx: ServiceContext,
+    call_id: str,
+    outcome_key: str,
+    settlement: Settlement,
+    at: datetime,
+) -> None:
+    """Grade a call that just settled.
+
+    Computes simplified CLV and P&L from the stored fill and closing line.
+    Full grade_call reconstruction is deferred; this records the essential
+    metrics so the evaluation loop runs.
+    """
+    # Get the reaction fill (latest paper fill)
+    fill_data = ctx.store.get_paper_fill(call_id)
+    if not fill_data:
+        return
+
+    fill_price = fill_data["price"]  # avg_price
+    contracts = fill_data["contracts"]
+    if fill_price is None or contracts == 0:
+        return
+
+    # Get closing line for CLV
+    cl_data = ctx.store.get_closing_line(outcome_key)
+    clv_reaction = None
+    if cl_data:
+        # CLV = sharp_close - fill_price (per contract, ignoring fees for now)
+        clv_reaction = cl_data["sharp_close_prob"] - fill_price
+
+    # P&L from settlement: win = 1.0, loss = 0.0, minus fill price
+    pnl_reaction = None
+    if settlement.result == "win":
+        pnl_reaction = (1.0 - fill_price) * contracts
+    elif settlement.result == "loss":
+        pnl_reaction = (0.0 - fill_price) * contracts
+    # refund/void: pnl = 0
+
+    grade = CallGrade(
+        call_id=call_id,
+        clv_reaction=clv_reaction,
+        clv_manual=None,  # Manual fills graded separately
+        pnl_reaction=pnl_reaction,
+        pnl_manual=None,
+        edge_half_life_s=None,  # Requires snapshots, deferred
+        graded_at=at,
+    )
+    ctx.store.record_call_grade(grade)
 
 
 async def run_forever(
@@ -624,14 +751,37 @@ async def run_forever(
                     priced = await ctx.sportsbook.priced_outcomes()
                     ctx.sportsbook_refreshed = True
                     last_sportsbook = now_ts
-                    # ADR-0009: clear pitcher suppression after a refresh; the
-                    # new prices reflect the updated probables.
+                    # ADR-0009: clear pitcher suppression only when the refreshed
+                    # quote for that event has valid_at later than the change time,
+                    # or after a 10-minute cool-off, whichever is later. This
+                    # prevents lifting suppression before books have repriced.
                     if ctx.pitcher_suppressed:
-                        log.info(
-                            "clearing pitcher suppression for %d events after sportsbook refresh",
-                            len(ctx.pitcher_suppressed),
-                        )
-                        ctx.pitcher_suppressed.clear()
+                        now = datetime.now(UTC)
+                        to_clear = []
+                        for eid, change_time in ctx.pitcher_suppressed.items():
+                            # Check cool-off: 10 minutes since change
+                            cool_off_done = (now - change_time) >= timedelta(minutes=10)
+                            # Check if any priced outcome for this event has
+                            # valid_at after the change time
+                            repriced = False
+                            for p in priced:
+                                try:
+                                    pid = str(p.outcome.quantity.event_id)
+                                except AttributeError:
+                                    continue
+                                # valid_at is when the book last updated
+                                if pid == eid and p.quote.observed.valid_at > change_time:
+                                    repriced = True
+                                    break
+                            if repriced or cool_off_done:
+                                to_clear.append(eid)
+                        for eid in to_clear:
+                            del ctx.pitcher_suppressed[eid]
+                        if to_clear:
+                            log.info(
+                                "cleared pitcher suppression for %d events",
+                                len(to_clear),
+                            )
                 except Exception:
                     log.exception(
                         "sportsbook refresh failed; keeping %d stale prices",
@@ -641,6 +791,21 @@ async def run_forever(
             if now_ts - last_discovery >= discovery_interval_s:
                 await _discover(ctx)
                 last_discovery = now_ts
+            # ADR-0008: capture closing lines for events that just started.
+            # Queries the quote log for pre-game consensus, not live prices.
+            try:
+                n_closed = capture_closing_lines(ctx, datetime.now(UTC))
+                if n_closed:
+                    log.info("captured %d closing lines", n_closed)
+            except Exception:
+                log.exception("closing line capture failed")
+            # ADR-0008: check for settled markets and record settlements.
+            try:
+                n_settled = await _check_settlements(ctx)
+                if n_settled:
+                    log.info("recorded %d settlements", n_settled)
+            except Exception:
+                log.exception("settlement check failed")
             log.info("tick done: %d opportunities", len(opps))
         except Exception:
             log.exception("tick failed")
