@@ -48,6 +48,47 @@ state store -> signals, alerts, fills (SQLite local / DynamoDB on AWS)
 - **Scheduler** (`scheduler.py`): the main loop. One tick = poll all, map,
   price, evaluate, notify, execute. Configurable cadence per venue.
 
+## Domain model (`domain/`)
+
+The foundation everything downstream stands on. Venue data is never trusted
+directly: it is normalized into domain objects, linked to a canonical market
+through the mapper, and only then priced or traded.
+
+- **CanonicalEvent / CanonicalMarket / Outcome** (`events.py`, `markets.py`):
+  one real-world event (a game), one proposition about it (Chiefs moneyline),
+  and the list of outcomes with optional lines. Market types include
+  moneyline, spread, total, prop, and combo (with `combo_legs` pointing at
+  the canonical leg markets, the home of the correlation detectors later).
+- **SettlementRules** (`settlement.py`): first-class, not an afterthought.
+  Overtime, DNP voids, stat-correction windows, postponement rules, and the
+  rule source are data, with a SHA fingerprint. Two markets are only
+  comparable when fingerprints match or an explicit equivalence is
+  registered.
+- **MarketMapper** (`mapping.py`): entity resolution across venues. Explicit
+  registration is the source of truth; `suggest()` ranks candidates for
+  human confirmation when bootstrapping. `resolve()` never guesses: unknown
+  ids return None, and a venue quote whose settlement fingerprint changed
+  under us is quarantined (priced, never signaled) and recorded in
+  `mismatches`. This is the trap from the research made impossible by
+  construction: a "different bet wearing a similar name" cannot reach the
+  EV engine.
+- **Quote / QuoteLog** (`quotes.py`, `log.py`): bitemporal, append-only.
+  Every observed price keeps `valid_at` (when it was valid at the venue) and
+  `observed_at` (when we saw it); the gap is the latency the stale-quote
+  detectors will trade against. `as_of(ts)` answers "what did we know at
+  time T", which makes backtests honest and enables closing line value:
+  our fill price vs the sharp consensus at close. The scheduler already
+  appends every polled snapshot; canonical linking arrives with the mapper
+  integration.
+- **MarketBook** (`quotes.py`): order-book levels with `avg_fill_price()`,
+  which walks the ladder. Depth-aware sizing plugs in here: a 4% edge on
+  the first $200 that is 0% by $2,000 must size against the ladder, not
+  top of book.
+- **FairValue** (`fairvalue.py`): consensus probability plus a confidence
+  score blending sharp-book weight share, book breadth, cross-book
+  agreement, and time to event. Confidence gates thresholds and sizing
+  downstream instead of living only in a log line.
+
 ## AWS deployment (target)
 
 - Docker image -> Amazon ECR.
