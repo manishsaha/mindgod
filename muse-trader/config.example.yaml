@@ -1,41 +1,66 @@
-# Copy to config.yaml and tune. All money values in USD.
+# MindGod configuration. Fee rates, edge thresholds, horizons, and risk
+# limits are configuration, not code: they change over time and differ
+# across markets.
+
 polling:
-  kalshi_interval_s: 60
-  polymarket_interval_s: 60
-  odds_api_interval_s: 300
+  exchange_interval_s: 60
+  sportsbook_interval_s: 300
 
 pricing:
-  devig_method: power        # additive | multiplicative | power
-  sharp_books: [pinnacle]    # weighted highest in consensus
-  sharp_weight: 3.0
-  book_weight: 1.0
+  devig_method: power  # additive | multiplicative | power (Shin: planned)
+  book_weights:
+    pinnacle: 3.0
+    circa: 3.0
+    draftkings: 1.0
+    fanduel: 1.0
 
 engine:
-  # Threshold on NET edge (after taker fee + slippage), not gross edge.
-  # A flat gross threshold is wrong: the taker fee peaks at 50c (~1.75c per
-  # contract) and shrinks toward the tails (~0.63c at 90c), so the minimum
-  # worthwhile gross edge is price-dependent. Gating on net edge handles it.
-  min_net_edge: 0.02
-  kelly_fraction: 0.25       # fractional Kelly
-  max_stake_per_bet: 100.0
-  max_exposure_per_event: 500.0
-  daily_loss_limit: 1000.0
-  slippage: 0.005            # assumed price slippage per contract
+  # Threshold applied to NET edge (gross edge minus per-contract taker fee
+  # minus slippage), widened further by fair-value uncertainty. Never apply
+  # a flat threshold to gross edge: the taker fee is price-dependent.
+  min_net_edge: "0.02"
+  kelly_fraction: "0.25"
+  max_stake_per_bet: "100.0"
+  max_exposure_per_event: "500.0"
+  slippage: "0.005"
+  # Stake shrink per unit of fair-value standard error: 1 / (1 + k * se).
+  uncertainty_aversion: "10.0"
+  # Edge-gate widening per unit of standard error: threshold + k * se.
+  threshold_widening: "2.0"
+  # Only positions settling within this horizon (principles section 7).
+  horizon_days: 7
 
-# Venue taker-fee schedules. Kalshi: ceil(0.07 x contracts x price x (1-price))
-# per order. These change over time and differ across markets: keep them here.
 fees:
-  kalshi:
-    taker_rate: 0.07
-    round_up_cents: true
-  polymarket:
-    taker_rate: 0.03         # varies ~3% sports to ~7% crypto; verify per market
-    round_up_cents: false
+  # Kalshi's published form: ceil(rate * contracts * P * (1 - P)) per order.
+  kalshi: {taker_rate: "0.07", maker_rate: "0.0"}
+  # Polymarket's fee varies by market; 3% is an approximation. Verify per
+  # market before production.
+  polymarket: {taker_rate: "0.03", maker_rate: "0.0"}
 
 alerts:
-  cooldown_s: 900            # per market+side dedup window
-  min_edge_move: 0.01        # re-alert if edge moves this much
+  cooldown_s: 900
+  min_edge_move: "0.01"
 
 execution:
-  mode: dry-run              # dry-run | paper | live
-  live_requires_flag: true   # live also needs --live on the command line
+  mode: dry-run  # dry-run | paper | live (live needs --live AND wiring)
+
+# Registered markets. Explicit registration is the source of truth: tickers
+# here are mapped onto canonical outcomes with the proposition builders.
+# The `start` should match the odds feed's commence_time (minute precision)
+# so feed outcomes equal listing outcomes. Unregistered markets go to the
+# review queue and are never traded.
+listings:
+  # - venue: kalshi
+  #   market_id: KXNFLGAME-26OCT05KCBUF
+  #   side: yes
+  #   league: nfl
+  #   home: KC
+  #   away: BUF
+  #   start: "2026-10-05T17:00:00Z"
+  #   outcome_kind: moneyline   # moneyline | spread | total
+  #   outcome_team: home        # home | away
+  #   # handicap: "-3.5"        # for spread
+  #   # total_line: "47.5"      # for total
+  #   # total_side: over        # over | under
+  #   refunds_on_tie: false
+  #   # token_id: "..."        # Polymarket CLOB token id

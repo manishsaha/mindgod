@@ -1,116 +1,130 @@
-from datetime import datetime, timedelta, timezone
+"""Each test protects a betting fact the domain model must get right."""
 
-from edge_engine.domain import (
-    CanonicalMarket,
-    FairSource,
-    MarketBook,
-    MarketMapper,
-    OrderBookLevel,
-    Outcome,
-    Quote,
-    QuoteLog,
-    SettlementRules,
-    build_fair_value,
+from datetime import UTC, datetime
+from decimal import Decimal as D
+
+import pytest
+
+from mindgod.domain.combos import Combo
+from mindgod.domain.fees import QuadraticFeeModel
+from mindgod.domain.primitives import ContractPrice, Observation, Probability
+from mindgod.domain.propositions import (
+    Comparator,
+    margin_exactly,
+    moneyline,
+    player_stat,
+    spread,
+    total,
 )
+from mindgod.domain.quotes import OrderBook, PriceLevel
+from mindgod.domain.sports import Event, EventId, League, PlayerId, TeamId
+from mindgod.domain.stats import Stat
+from mindgod.domain.terms import Payoff, Terms, TermsDifference, VoidPolicy, differences
+from mindgod.domain.valuation import FairValue
+from mindgod.domain.venues import ListingKey, VenueId
 
-T0 = datetime(2026, 10, 5, 17, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 10, 4, 17, 0, tzinfo=UTC)
+KC, BUF = TeamId("nfl-kc"), TeamId("nfl-buf")
+NFL_GAME = Event(EventId("nfl-2026-10-04-buf-at-kc"), League.NFL, KC, BUF, NOW)
+NYY, BOS = TeamId("mlb-nyy"), TeamId("mlb-bos")
+MLB_NIGHTCAP = Event(EventId("mlb-2026-09-26-bos-at-nyy-g2"), League.MLB, NYY, BOS, NOW, 2)
+KALSHI_KEY = ListingKey(VenueId("kalshi"), "KXNFLGAME-TEST", "yes")
 
 
-def make_market(**over):
-    kw = dict(
-        market_id="nfl:KC-BUF:20261005:moneyline",
-        event_id="nfl:KC-BUF:20261005",
-        label="Chiefs vs Bills",
-        market_type="moneyline",
-        outcomes=[Outcome("home", "Chiefs"), Outcome("away", "Bills")],
-        settlement=SettlementRules(source="kalshi"),
-        starts_at=T0,
+class TestProbability:
+    def test_american_odds_include_the_vig(self) -> None:
+        assert Probability.from_american_odds(-110).value == pytest.approx(0.52381, abs=1e-5)
+        assert Probability.from_american_odds(+150).value == pytest.approx(0.4)
+
+    def test_impossible_odds_are_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            Probability.from_american_odds(50)
+
+
+class TestCanonicalOutcomes:
+    def test_integer_and_half_point_lines_share_the_winning_outcome(self) -> None:
+        # Book "KC -3" wins on exactly the results where "KC wins by more than 3.5" wins.
+        assert spread(NFL_GAME, KC, D("-3")) == spread(NFL_GAME, KC, D("-3.5"))
+
+    def test_away_side_is_the_complement_of_the_home_side(self) -> None:
+        assert spread(NFL_GAME, BUF, D("3.5")) == spread(NFL_GAME, KC, D("-3.5")).complement()
+
+    def test_moneyline_complement_includes_the_tie(self) -> None:
+        assert moneyline(NFL_GAME, KC).complement() != moneyline(NFL_GAME, BUF)
+
+    def test_ladder_rungs_imply_lower_rungs(self) -> None:
+        over_50_5 = total(NFL_GAME, Comparator.GT, D("50.5"))
+        over_44_5 = total(NFL_GAME, Comparator.GT, D("44.5"))
+        assert over_50_5.implies(over_44_5)
+        assert not over_44_5.implies(over_50_5)
+
+    def test_stats_are_validated_per_league(self) -> None:
+        judge = PlayerId("mlb-aaron-judge")
+        player_stat(MLB_NIGHTCAP, NYY, judge, Stat.TOTAL_BASES, Comparator.GT, D("1.5"))
+        with pytest.raises(ValueError):
+            player_stat(MLB_NIGHTCAP, NYY, judge, Stat.PASSING_YARDS, Comparator.GT, D("1.5"))
+
+    def test_teams_must_be_playing(self) -> None:
+        with pytest.raises(ValueError):
+            moneyline(NFL_GAME, NYY)
+
+
+class TestTerms:
+    def test_nfl_tie_rule_makes_moneylines_different_bets(self) -> None:
+        exchange = Terms(Payoff(moneyline(NFL_GAME, KC)))
+        book = Terms(Payoff(moneyline(NFL_GAME, KC), margin_exactly(NFL_GAME, KC, D(0))))
+        assert differences(exchange, book) == {TermsDifference.REFUND}
+
+    def test_key_number_push_is_the_only_gap_between_minus_3_and_minus_3_5(self) -> None:
+        book = Terms(Payoff(spread(NFL_GAME, KC, D("-3")), margin_exactly(NFL_GAME, KC, D(3))))
+        exchange = Terms(Payoff(spread(NFL_GAME, KC, D("-3.5"))))
+        assert differences(book, exchange) == {TermsDifference.REFUND}
+
+    def test_listed_pitchers_change_the_bet(self) -> None:
+        action = Terms(Payoff(moneyline(MLB_NIGHTCAP, NYY)))
+        listed = Terms(
+            Payoff(moneyline(MLB_NIGHTCAP, NYY)),
+            VoidPolicy(listed_pitchers=frozenset({PlayerId("p1"), PlayerId("p2")})),
+        )
+        assert differences(action, listed) == {TermsDifference.LISTED_PITCHERS}
+
+
+class TestFees:
+    fees = QuadraticFeeModel(taker_rate=D("0.07"), maker_rate=D("0"))
+
+    def test_fee_peaks_at_even_money(self) -> None:
+        assert self.fees.taker_fee(ContractPrice(D("0.50")), 100) == D("1.75")
+        assert self.fees.taker_fee(ContractPrice(D("0.90")), 100) == D("0.63")
+
+    def test_small_orders_pay_a_rounding_penalty(self) -> None:
+        assert self.fees.taker_fee(ContractPrice(D("0.50")), 1) == D("0.02")
+
+
+class TestDepthAndEdge:
+    book = OrderBook(
+        KALSHI_KEY,
+        asks=(
+            PriceLevel(ContractPrice(D("0.45")), 100),
+            PriceLevel(ContractPrice(D("0.48")), 200),
+        ),
+        bids=(),
+        observed=Observation(NOW, NOW),
     )
-    kw.update(over)
-    return CanonicalMarket(**kw)
+
+    def test_average_price_worsens_with_size(self) -> None:
+        assert self.book.cost_to_buy(100).average_price == D("0.45")  # type: ignore[union-attr]
+        assert self.book.cost_to_buy(300).average_price == D("0.47")  # type: ignore[union-attr]
+        assert self.book.cost_to_buy(301) is None
+
+    def test_expected_value_is_net_of_fees(self) -> None:
+        fill = self.book.cost_to_buy(100)
+        assert fill is not None
+        fee = QuadraticFeeModel(D("0.07"), D("0")).taker_fee(fill.worst_price, fill.contracts)
+        fair = FairValue(moneyline(NFL_GAME, KC), Probability(0.55), 0.01, NOW, "test")
+        assert fair.expected_value_per_contract(fill, fee) == D("0.0826")
 
 
-def test_settlement_fingerprint_detects_rule_changes():
-    a = SettlementRules(source="kalshi")
-    assert a.fingerprint() == SettlementRules(source="kalshi").fingerprint()
-    assert a.fingerprint() != SettlementRules(
-        source="kalshi", overtime_included=False).fingerprint()
-
-
-def test_mapper_resolves_and_quarantines_rule_mismatch():
-    mapper = MarketMapper()
-    market = make_market()
-    fp = market.settlement.fingerprint()
-    mapper.register(market, {"kalshi": ("KXNFLGAME-26OCT05KCBUF", fp)})
-
-    assert mapper.resolve("kalshi", "KXNFLGAME-26OCT05KCBUF", fp) is market
-    assert mapper.resolve("kalshi", "UNKNOWN-TICKER", fp) is None
-
-    changed = SettlementRules(source="kalshi",
-                              overtime_included=False).fingerprint()
-    assert mapper.resolve("kalshi", "KXNFLGAME-26OCT05KCBUF", changed) is None
-    assert len(mapper.mismatches) == 1
-    assert mapper.mismatches[0].canonical_market_id == market.market_id
-
-
-def test_mapper_suggest_ranks_best_match_first():
-    mapper = MarketMapper()
-    target = make_market()
-    other = make_market(market_id="nfl:KC-MIA:20261012:moneyline",
-                        label="Chiefs vs Dolphins",
-                        starts_at=T0 + timedelta(days=7))
-    mapper.register(target, {})
-    mapper.register(other, {})
-
-    scored = mapper.suggest("Kansas City Chiefs vs Buffalo Bills", starts_at=T0)
-    assert scored[0][0] is target
-    assert scored[0][1] > scored[1][1]
-
-
-def test_quote_log_is_bitemporal():
-    log = QuoteLog(":memory:")
-
-    def q(price, observed):
-        return Quote(venue="kalshi", venue_market_id="T1", outcome_id="yes",
-                     side="ask", price=price, canonical_market_id="m1",
-                     valid_at=observed, observed_at=observed)
-
-    t1, t2, t3 = T0, T0 + timedelta(minutes=1), T0 + timedelta(minutes=2)
-    for price, ts in ((0.50, t1), (0.55, t2), (0.60, t3)):
-        log.append(q(price, ts))
-
-    # "What did we know at t2?" must not see the t3 quote.
-    state = log.as_of("m1", t2)
-    assert state[("kalshi", "yes", "ask")].price == 0.55
-    state = log.as_of("m1", t3)
-    assert state[("kalshi", "yes", "ask")].price == 0.60
-
-    hist = log.history("m1", "kalshi", "yes", "ask")
-    assert [x.price for x in hist] == [0.50, 0.55, 0.60]
-
-
-def test_market_book_walks_the_ladder():
-    book = MarketBook(
-        venue="kalshi", venue_market_id="T1", outcome_id="yes",
-        asks=[OrderBookLevel(0.50, 100), OrderBookLevel(0.52, 100)],
-    )
-    assert abs(book.avg_fill_price(150) - (100 * 0.50 + 50 * 0.52) / 150) < 1e-9
-    assert book.avg_fill_price(250) is None  # insufficient depth
-
-
-def test_fair_value_confidence_rewards_sharp_breadth_recency():
-    now = T0 - timedelta(hours=1)
-    sharp = build_fair_value(
-        "m1", "yes",
-        [FairSource("pinnacle", 3.0, 0.60),
-         FairSource("draftkings", 1.0, 0.58),
-         FairSource("fanduel", 1.0, 0.62)],
-        starts_at=T0, now=now,
-    )
-    thin = build_fair_value(
-        "m1", "yes", [FairSource("fanduel", 1.0, 0.60)],
-        starts_at=T0 + timedelta(days=3), now=now,
-    )
-    assert abs(sharp.prob - 0.60) < 1e-9
-    assert sharp.confidence > thin.confidence
-    assert 0.0 <= thin.confidence <= 1.0
+class TestCombos:
+    def test_same_game_combo_is_detected(self) -> None:
+        legs = frozenset({moneyline(NFL_GAME, KC), total(NFL_GAME, Comparator.GT, D("47.5"))})
+        assert Combo(legs).is_same_game

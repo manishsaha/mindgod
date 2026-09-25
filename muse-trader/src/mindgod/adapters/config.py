@@ -1,0 +1,126 @@
+"""Configuration: YAML file layered over environment variables.
+
+Fee rates, edge thresholds, horizons, and risk limits are configuration,
+not code. They change over time and differ across markets.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field, fields
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+
+@dataclass(frozen=True, slots=True)
+class FeeModelConfig:
+    taker_rate: str = "0.07"
+    maker_rate: str = "0.0"
+
+
+@dataclass(frozen=True, slots=True)
+class EngineConfig:
+    min_net_edge: str = "0.02"
+    kelly_fraction: str = "0.25"
+    max_stake_per_bet: str = "100.0"
+    max_exposure_per_event: str = "500.0"
+    slippage: str = "0.005"
+    uncertainty_aversion: str = "10.0"
+    threshold_widening: str = "2.0"
+    horizon_days: int = 7
+
+
+@dataclass(frozen=True, slots=True)
+class PricingConfig:
+    devig_method: str = "power"
+    book_weights: dict[str, float] = field(
+        default_factory=lambda: {"pinnacle": 3.0}
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PollingConfig:
+    exchange_interval_s: int = 60
+    sportsbook_interval_s: int = 300
+
+
+@dataclass(frozen=True, slots=True)
+class AlertsConfig:
+    cooldown_s: int = 900
+    min_edge_move: str = "0.01"
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionConfig:
+    mode: str = "dry-run"  # dry-run | paper | live
+
+
+@dataclass(frozen=True, slots=True)
+class ListingSpec:
+    """One registered market: a venue ticker mapped onto a canonical outcome.
+
+    outcome_team is "home" or "away" for moneyline/spread. For side "no" the
+    outcome is complemented at build time: buying the listing's "yes" is
+    buying the other side of the proposition.
+    """
+
+    venue: str
+    market_id: str
+    side: str = "yes"
+    league: str = "nfl"
+    home: str = "KC"
+    away: str = "BUF"
+    start: str = ""
+    game_number: int = 1
+    outcome_kind: str = "moneyline"  # moneyline | spread | total
+    outcome_team: str = "home"
+    handicap: str = "0"
+    total_line: str = "0"
+    total_side: str = "over"  # over | under
+    refunds_on_tie: bool = False
+    token_id: str = ""  # Polymarket CLOB token id, when known
+
+
+@dataclass(frozen=True, slots=True)
+class Settings:
+    polling: PollingConfig = field(default_factory=PollingConfig)
+    pricing: PricingConfig = field(default_factory=PricingConfig)
+    engine: EngineConfig = field(default_factory=EngineConfig)
+    fees: dict[str, FeeModelConfig] = field(default_factory=dict)
+    alerts: AlertsConfig = field(default_factory=AlertsConfig)
+    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    listings: tuple[ListingSpec, ...] = ()
+
+
+def _build[T](cls: type[T], data: Any) -> T:
+    if not isinstance(data, dict):
+        return cls()
+    probe: Any = cls()
+    known = {f.name for f in fields(probe)}
+    return cls(**{k: v for k, v in data.items() if k in known})
+
+
+def load_settings(path: str | Path | None = None) -> Settings:
+    if path is None:
+        for candidate in ("config.yaml", "config.example.yaml"):
+            if Path(candidate).exists():
+                path = candidate
+                break
+    if path is None:
+        return Settings()
+    with open(path, encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+    return Settings(
+        polling=_build(PollingConfig, data.get("polling")),
+        pricing=_build(PricingConfig, data.get("pricing")),
+        engine=_build(EngineConfig, data.get("engine")),
+        fees={
+            venue: _build(FeeModelConfig, cfg)
+            for venue, cfg in (data.get("fees") or {}).items()
+        },
+        alerts=_build(AlertsConfig, data.get("alerts")),
+        execution=_build(ExecutionConfig, data.get("execution")),
+        listings=tuple(
+            _build(ListingSpec, spec) for spec in (data.get("listings") or [])
+        ),
+    )
