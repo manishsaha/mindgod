@@ -18,19 +18,27 @@ the application ever sees it.
 ## Tick flow
 
 ```
-OddsApiSource.priced_outcomes()      sportsbook prices -> PricedOutcome
-        |
-WeightedConsensusModel.value()       devig per book-market, weight books
-        |                            -> dict[Outcome, FairValue]
+OddsApiSource.priced_outcomes()      sportsbook prices -> PricedOutcome,
+        |                            each carrying its settlement Terms;
+        |                            refreshed on its own cadence, failures
+        |                            keep the previous prices
+WeightedConsensusModel.value()       devig per book-market *within each
+        |                            terms partition* -> dict[Outcome,
+        |                            FairValue]; partitions never mix
 KalshiExchange / PolymarketExchange  order books for registered listings
-        |
+        |                            (Kalshi: batch /markets/orderbooks,
+        |                            bids-only ladders, ask = 1 - other bid)
 RegistryResolver                     ticker -> Listing (explicit table);
-                                     unknown -> review queue, never traded
-        |
+                                     unknown -> review queue, never traded;
+                                     event identity is date + game_number
 ValueDetector.detect()               net-edge gate + fractional Kelly +
-                                     uncertainty shrink + depth cap
+                                     uncertainty shrink + depth cap, but
+                                     only against a fair value whose source
+                                     terms equal the listing's terms
         |
-ExposureLimits -> Discord -> execution (dry-run | paper | live-fails-closed)
+ExposureLimits -> execution (dry-run | paper | live-fails-closed)
+        |
+        +-> Discord notify (async, after execution, off the critical path)
 ```
 
 ## Key design points
@@ -40,29 +48,65 @@ ExposureLimits -> Discord -> execution (dry-run | paper | live-fails-closed)
   normal form, so equality means "same outcome". Settlement differences
   (push refunds, listed pitchers, voids) live in `Terms`, separate from the
   outcome. Two listings are the same bet only when both match.
+- **Terms travel with every price.** `PricedOutcome` carries the book's
+  settlement terms: a whole-number spread or total line refunds pushes, a
+  half-point line cannot push, an NFL moneyline refunds ties. Fair values
+  are built inside terms partitions and a listing only uses a fair value
+  whose source terms are exactly its own. A 50% devig on KC -3 at -110 is
+  conditional on no push; using it against a push-refunding Kalshi listing
+  invents edge that does not exist. See ADR-0005.
+- **Kalshi books are bids only.** `yes_dollars` / `no_dollars` hold resting
+  bids, ascending, best last. The yes ask is `1 - best no bid`. Prices and
+  counts are fixed-point strings; fractional counts floor to whole
+  contracts. Treating a yes bid as a yes ask once printed a fake 5c edge;
+  the parser is tested against a captured production response. See
+  ADR-0006.
+- **Event identity is date + game number.** Start-time moves (rain delays,
+  NFL flex) do not change identity; minute-level timestamps caused silent
+  non-matches. Listings require a configured start; a feed event that
+  shares a listing's teams and date but not its game number logs a drift
+  warning and is never priced.
 - **Net-edge gating.** The threshold applies to gross edge minus
   per-contract taker fee minus slippage, widened by fair-value uncertainty.
   A flat gross-edge threshold is wrong because Kalshi-style fees peak at 50c.
+  The standard-error floor keeps single-book consensus from claiming false
+  certainty.
 - **Two-pass sizing.** Size tentatively on gross edge to learn the contract
   count (which sets the per-contract fee under per-order round-up), gate on
   net edge, then size finally on net edge, shrunk by uncertainty and capped
   by order-book depth. The final edge is computed at the fill's average
   price, not the top of the book.
 - **Bitemporal observations.** Every quote carries `valid_at` (true at the
-  venue) and `recorded_at` (seen by us). The store is append-only; `as_of`
+  venue: the Odds API market `last_update`) and `recorded_at` (seen by us).
+  The store is append-only with stable outcome keys (never `repr`); `as_of`
   reconstructs what we knew at any moment for honest backtests and CLV.
 - **Fail-closed execution.** Live brokers raise until their order paths are
   implemented, eligibility is verified (notably NY for Kalshi sports
   contracts and US geo-blocking for Polymarket Global), and live trading is
-  explicitly authorized.
+  explicitly authorized. Paper execution consumes its simulated liquidity so
+  one book's depth cannot be refilled forever.
+
+## Polling
+
+Exchange books move every minute; sportsbook odds cost credits per call, so
+they refresh on a slower cadence (`sportsbook_interval_s`); discovery only
+feeds the human review queue and runs hourly. A sportsbook failure keeps the
+previous prices instead of killing the tick. Listings beyond `horizon_days`
+are not traded.
 
 ## Current state
 
-Working: domain model, pricing (additive/multiplicative/power devig),
-fee-aware detection, listing registry with terms-change quarantine, SQLite
-store, Discord notifier, dry-run/paper execution, service loop.
+Working: domain model, pricing (additive/multiplicative/power devig, terms
+partitions, standard-error floor), fee-aware detection with the equal-terms
+rule, bid-only Kalshi parsing (batch endpoint, fractional counts floored),
+listing registry with terms-change quarantine, date+game-number event
+identity, SQLite store with stable outcome keys, Discord notifier (async,
+post-execution), dry-run/paper execution (paper consumes simulated
+liquidity), service loop with separate sportsbook/discovery cadences,
+horizon filtering.
 
-Not yet: Shin devig, combo/correlation detection, ladder-consistency
+Not yet: Shin devig, push-probability modeling (half-point lines accepted
+as-is until then), combo/correlation detection, ladder-consistency
 detectors, settlement feeds (daily loss limits need them), maker execution
 (cancellation/inventory controls), DynamoDB/AWS deployment, closing-price
 capture and CLV reporting.
