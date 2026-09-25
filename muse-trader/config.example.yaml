@@ -44,6 +44,11 @@ engine:
   # (probability) since the last sportsbook refresh: news reprices the
   # exchange in seconds while the consensus lags by minutes.
   max_kalshi_move: 0.03
+  # Skip the move check when the book's spread exceeds this: on thin books
+  # the mid jumps with single orders and would cause false suppressions.
+  move_check_max_spread: 0.06
+  # ADR-0008: paper fills model human reaction time (seconds).
+  reaction_delay_s: 60
   # Discovery only feeds the human review queue; restrict it to the series
   # we actually price.
   kalshi_discovery_series: ["KXNFLGAME", "KXMLBGAME"]

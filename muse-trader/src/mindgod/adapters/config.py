@@ -32,6 +32,10 @@ class EngineConfig:
     # Move check: suppress an opportunity when the exchange mid moved more
     # than this (probability) since the last sportsbook refresh.
     max_kalshi_move: float = 0.03
+    # Spread gate: skip the move check when the book's spread exceeds this.
+    move_check_max_spread: float = 0.06
+    # ADR-0008: paper fills model human reaction time.
+    reaction_delay_s: int = 60
     # Discovery only feeds the review queue; restrict it to the series we
     # actually price instead of pulling every kind of market.
     kalshi_discovery_series: list[str] = field(default_factory=lambda: ["KXNFLGAME", "KXMLBGAME"])
@@ -49,6 +53,9 @@ class PricingConfig:
     # approaching the gate widen the error bar by stale_se_per_minute.
     max_quote_age_s: int = 900
     stale_se_per_minute: float = 0.001
+    # ADR-0009: extra SE (in quadrature) when the book's pitcher rule is
+    # UNKNOWN or LISTED vs the venue's ACTION.
+    pitcher_rule_se: float = 0.01
 
 
 @dataclass(frozen=True, slots=True)

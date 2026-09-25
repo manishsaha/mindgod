@@ -1,7 +1,7 @@
 # ADR-0008: Alert-first; manual execution graded by paper tracking
 
 Date: 2026-09-25
-Status: Accepted. Amends ADR-0003.
+Status: Accepted. Amends ADR-0003. Implementation: partial (part 1 complete, part 2 data model and grading complete; Discord "Took it" button requires Interactions API setup).
 
 ## Context
 

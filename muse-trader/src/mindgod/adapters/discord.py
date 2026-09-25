@@ -16,6 +16,7 @@ import httpx
 
 from mindgod.application.opportunities import Opportunity
 from mindgod.application.ports import Notifier
+from mindgod.application.pricing import outcome_key
 
 log = logging.getLogger("mindgod.adapters.discord")
 
@@ -26,73 +27,127 @@ class DiscordNotifier(Notifier):
         webhook_url: str,
         cooldown_s: int = 900,
         min_edge_move: Decimal = Decimal("0.01"),
+        min_x_move: Decimal = Decimal("0.01"),
     ) -> None:
         self._webhook_url = webhook_url
         self._cooldown_s = cooldown_s
         self._min_edge_move = min_edge_move
-        self._last_sent: dict[str, tuple[float, Decimal]] = {}
+        self._min_x_move = min_x_move
+        self._last_sent: dict[str, tuple[float, Decimal, Decimal | None]] = {}
 
     def _key(self, opp: Opportunity) -> str:
-        key = opp.listing
-        return f"{key.venue_id}:{key.market_id}:{key.side}"
+        # ADR-0008: deduplicate by canonical outcome across venues.
+        return outcome_key(opp.outcome)
 
     def should_send(self, opp: Opportunity) -> bool:
         last = self._last_sent.get(self._key(opp))
         if last is None:
             return True
-        ts, edge = last
+        ts, edge, last_x = last
         if time.time() - ts > self._cooldown_s:
             return True
-        return abs(opp.edge_net - edge) >= self._min_edge_move
+        if abs(opp.edge_net - edge) >= self._min_edge_move:
+            return True
+        # Re-alert only when X moves materially.
+        if opp.limit_price is not None and last_x is not None:
+            return abs(opp.limit_price - last_x) >= self._min_x_move
+        return False
 
     def _payload(self, opp: Opportunity) -> dict[str, Any]:
         key = opp.listing
         fair = opp.fair_value
         color = 0x2ECC71 if opp.edge_net > Decimal("0.05") else 0xF1C40F
+        # ADR-0008 alert format: price limit, not price.
+        if opp.limit_price is not None:
+            x_cents = int(opp.limit_price * 100)
+            title = (
+                f"Buy up to {opp.fill.contracts} of {key.market_id} "
+                f"({key.side}) at \u2264 {x_cents}\u00a2"
+            )
+            fields: list[dict[str, Any]] = [
+                {
+                    "name": "Fair value",
+                    "value": (
+                        f"{float(fair.probability.value):.1%} "
+                        f"(\u00b1{float(fair.standard_error):.3f})"
+                    ),
+                    "inline": True,
+                },
+                {
+                    "name": "Net edge at ask",
+                    "value": f"{float(opp.edge_net):.2%}",
+                    "inline": True,
+                },
+                {
+                    "name": f"Depth at \u2264 {x_cents}\u00a2",
+                    "value": str(opp.depth_at_x),
+                    "inline": True,
+                },
+                {
+                    "name": "Ask at alert",
+                    "value": f"{float(opp.fill.average_price):.3f}",
+                    "inline": True,
+                },
+                {
+                    "name": "Fee",
+                    "value": f"${float(opp.fee):.2f}",
+                    "inline": True,
+                },
+                {
+                    "name": "Stake",
+                    "value": f"${float(opp.stake):.2f}",
+                    "inline": True,
+                },
+            ]
+        else:
+            title = f"+EV: {key.market_id} ({key.side})"
+            fields = [
+                {"name": "Venue", "value": str(key.venue_id), "inline": True},
+                {
+                    "name": "Outcome",
+                    "value": repr(opp.outcome)[:1024],
+                    "inline": False,
+                },
+                {
+                    "name": "Fill (avg)",
+                    "value": f"{float(opp.fill.average_price):.3f}",
+                    "inline": True,
+                },
+                {
+                    "name": "Fair value",
+                    "value": (
+                        f"{float(fair.probability.value):.1%} (se {float(fair.standard_error):.3f})"
+                    ),
+                    "inline": True,
+                },
+                {
+                    "name": "Net edge",
+                    "value": f"{float(opp.edge_net):.2%}",
+                    "inline": True,
+                },
+                {
+                    "name": "Contracts",
+                    "value": str(opp.fill.contracts),
+                    "inline": True,
+                },
+                {
+                    "name": "Stake",
+                    "value": f"${float(opp.stake):.2f}",
+                    "inline": True,
+                },
+                {
+                    "name": "Fee",
+                    "value": f"${float(opp.fee):.2f}",
+                    "inline": True,
+                },
+            ]
         return {
             "username": "MindGod",
             "embeds": [
                 {
-                    "title": f"+EV: {key.market_id} ({key.side})",
+                    "title": title,
                     "color": color,
-                    "fields": [
-                        {"name": "Venue", "value": str(key.venue_id), "inline": True},
-                        {
-                            "name": "Outcome",
-                            "value": repr(opp.outcome)[:1024],
-                            "inline": False,
-                        },
-                        {
-                            "name": "Fill (avg)",
-                            "value": f"{opp.fill.average_price:.3f}",
-                            "inline": True,
-                        },
-                        {
-                            "name": "Fair value",
-                            "value": f"{fair.probability.value:.1%} (se {fair.standard_error:.3f})",
-                            "inline": True,
-                        },
-                        {
-                            "name": "Net edge",
-                            "value": f"{opp.edge_net:.2%}",
-                            "inline": True,
-                        },
-                        {
-                            "name": "Contracts",
-                            "value": str(opp.fill.contracts),
-                            "inline": True,
-                        },
-                        {
-                            "name": "Stake",
-                            "value": f"${opp.stake:.2f}",
-                            "inline": True,
-                        },
-                        {
-                            "name": "Fee",
-                            "value": f"${opp.fee:.2f}",
-                            "inline": True,
-                        },
-                    ],
+                    "fields": fields,
                     "footer": {"text": fair.method},
                 }
             ],
@@ -112,6 +167,7 @@ class DiscordNotifier(Notifier):
                     self._last_sent[self._key(opp)] = (
                         time.time(),
                         opp.edge_net,
+                        opp.limit_price,
                     )
                     return True
                 if resp.status_code == 429:

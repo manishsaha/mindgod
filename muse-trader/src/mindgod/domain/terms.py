@@ -24,6 +24,14 @@ class PostponementRule(StrEnum):
     ACTION_IF_PLAYED_WITHIN_WINDOW = "action_if_played_within_window"
 
 
+class PitcherRule(StrEnum):
+    """How an MLB moneyline settles with respect to starting pitchers."""
+
+    ACTION = "action"  # settles regardless of who starts
+    LISTED = "listed"  # voids unless the listed pitchers both start
+    UNKNOWN = "unknown"  # the source does not say
+
+
 @dataclass(frozen=True, slots=True)
 class Payoff:
     """Win if `wins_if` happens, refund if `refunds_if` happens, otherwise lose."""
@@ -37,6 +45,7 @@ class VoidPolicy:
     on_player_absent: AbsenceRule = AbsenceRule.VOID
     on_postponement: PostponementRule = PostponementRule.VOID
     listed_pitchers: frozenset[PlayerId] = frozenset()  # MLB books: void unless these start
+    pitcher_rule: PitcherRule = PitcherRule.ACTION
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +60,7 @@ class TermsDifference(StrEnum):
     PLAYER_ABSENT = "player_absent"
     POSTPONEMENT = "postponement"
     LISTED_PITCHERS = "listed_pitchers"
+    PITCHER_RULE = "pitcher_rule"
 
 
 def differences(a: Terms, b: Terms) -> frozenset[TermsDifference]:
@@ -67,5 +77,15 @@ def differences(a: Terms, b: Terms) -> frozenset[TermsDifference]:
         TermsDifference.LISTED_PITCHERS: (
             a.void_policy.listed_pitchers != b.void_policy.listed_pitchers
         ),
+        TermsDifference.PITCHER_RULE: (a.void_policy.pitcher_rule != b.void_policy.pitcher_rule),
     }
     return frozenset(difference for difference, differs in checks.items() if differs)
+
+
+def pitcher_rules_compatible(book_rule: PitcherRule, venue_rule: PitcherRule) -> bool:
+    """ADR-0009: pitcher rules are compatible when equal, or when the book's
+    UNKNOWN/LISTED rule is compared against the venue's ACTION rule (with
+    added uncertainty). Anything else is rejected."""
+    return book_rule == venue_rule or (
+        venue_rule == PitcherRule.ACTION and book_rule in (PitcherRule.UNKNOWN, PitcherRule.LISTED)
+    )

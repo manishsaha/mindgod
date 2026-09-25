@@ -182,7 +182,7 @@ def devig_market_groups(
     """
     groups: dict[str, list[PricedOutcome]] = defaultdict(list)
     for p in priced:
-        age = (as_of - p.quote.observed.valid_at).total_seconds()
+        age = (as_of - p.quote.observed.recorded_at).total_seconds()
         if age > max_quote_age_s:
             log.warning(
                 "dropping quote older than %.0fs: %s (age %.0fs)",
@@ -208,7 +208,7 @@ def devig_market_groups(
             )
         implied = [p.quote.implied_probability.value for p in group]
         for p, fair in zip(group, devig(implied, method), strict=True):
-            age = max(0.0, (as_of - p.quote.observed.valid_at).total_seconds())
+            age = max(0.0, (as_of - p.quote.observed.recorded_at).total_seconds())
             out.append(
                 DeviggedPrice(
                     outcome=p.outcome,
@@ -274,11 +274,12 @@ class WeightedConsensusModel:
             fair_values: dict[Outcome, FairValue] = {}
             for outcome, entries in by_outcome.items():
                 prob = consensus([(e.fair_probability, e.weight) for e in entries])
-                se = max(
+                base = max(
                     _weighted_std([(e.fair_probability, e.weight) for e in entries], prob),
                     self._min_standard_error,
-                    max(e.age_s for e in entries) / 60.0 * self._stale_se_per_minute,
                 )
+                age_term = max(e.age_s for e in entries) / 60.0 * self._stale_se_per_minute
+                se = math.sqrt(base * base + age_term * age_term)
                 fair_values[outcome] = FairValue(
                     outcome=outcome,
                     probability=Probability(prob),

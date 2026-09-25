@@ -201,24 +201,24 @@ class OddsApiSource(SportsbookSource):
             team = _team_for_abbr(event, abbr)
             if team is None:
                 return None
-            if league is League.MLB:
-                # Sportsbooks settle MLB moneylines on listed pitchers (both
-                # scheduled starters must throw); neither feed reports the
-                # pitchers, so the terms can never be proven equal. Skip the
-                # market loudly instead of trading a hidden mismatch.
-                eid = str(event.id)
-                if eid not in self._mlb_warned:
-                    self._mlb_warned.add(eid)
-                    log.warning(
-                        "skipping MLB moneyline for %s: listed-pitcher terms "
-                        "are not captured by either feed",
-                        eid,
-                    )
-                return None
             outcome = moneyline(event, team)
             # NFL games can tie: the book refunds the stake. MLB games play
             # on, so there is no tie refund to carry.
             refunds = margin_exactly(event, team, Decimal(0)) if league is League.NFL else None
+            # ADR-0009: MLB moneylines settle on listed pitchers at some books
+            # and as action at others; neither feed reports the rule, so we
+            # emit UNKNOWN and let the application decide compatibility.
+            if league is League.MLB:
+                from mindgod.domain.terms import PitcherRule, VoidPolicy
+
+                return (
+                    outcome,
+                    str(abbr),
+                    Terms(
+                        Payoff(outcome, refunds),
+                        VoidPolicy(pitcher_rule=PitcherRule.UNKNOWN),
+                    ),
+                )
             return outcome, str(abbr), Terms(Payoff(outcome, refunds))
         if market_key == "spreads":
             abbr = team_abbr(league, name)

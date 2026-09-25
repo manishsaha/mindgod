@@ -128,3 +128,28 @@ class TestCombos:
     def test_same_game_combo_is_detected(self) -> None:
         legs = frozenset({moneyline(NFL_GAME, KC), total(NFL_GAME, Comparator.GT, D("47.5"))})
         assert Combo(legs).is_same_game
+
+
+class TestPitcherRule:
+    """ADR-0009: pitcher rule compatibility."""
+
+    def test_equal_rules_compatible(self) -> None:
+        from mindgod.domain.terms import PitcherRule, pitcher_rules_compatible
+
+        assert pitcher_rules_compatible(PitcherRule.ACTION, PitcherRule.ACTION)
+        assert pitcher_rules_compatible(PitcherRule.LISTED, PitcherRule.LISTED)
+        assert pitcher_rules_compatible(PitcherRule.UNKNOWN, PitcherRule.UNKNOWN)
+
+    def test_unknown_vs_action_compatible(self) -> None:
+        from mindgod.domain.terms import PitcherRule, pitcher_rules_compatible
+
+        assert pitcher_rules_compatible(PitcherRule.UNKNOWN, PitcherRule.ACTION)
+        assert pitcher_rules_compatible(PitcherRule.LISTED, PitcherRule.ACTION)
+
+    def test_action_vs_unknown_incompatible(self) -> None:
+        from mindgod.domain.terms import PitcherRule, pitcher_rules_compatible
+
+        # ACTION book vs UNKNOWN venue: the venue might void, the book won't.
+        # This is not the safe direction.
+        assert not pitcher_rules_compatible(PitcherRule.ACTION, PitcherRule.UNKNOWN)
+        assert not pitcher_rules_compatible(PitcherRule.ACTION, PitcherRule.LISTED)

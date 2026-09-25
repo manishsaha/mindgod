@@ -18,6 +18,15 @@ from mindgod.domain.valuation import FairValue
 from mindgod.domain.venues import Listing, ListingKey, VenueId
 
 if TYPE_CHECKING:
+    from .calls import (
+        Call,
+        CallGrade,
+        CallSnapshot,
+        ClosingLine,
+        ManualFill,
+        PaperFill,
+        Settlement,
+    )
     from .opportunities import Opportunity
 
 
@@ -92,6 +101,26 @@ class ListingResolver(Protocol):
     def review_queue(self) -> list[UnmappedMarket]: ...
 
 
+@dataclass(frozen=True, slots=True)
+class ProbablePitchers:
+    """Announced starters for an MLB game."""
+
+    event_id: str
+    home_pitcher: str | None
+    away_pitcher: str | None
+    announced_at: datetime
+
+
+class ProbablePitcherSource(Protocol):
+    """ADR-0009: records each game's probable starters.
+
+    When probables change, or fewer than two are announced, MLB listings for
+    that game are suppressed until the next sportsbook refresh after the change.
+    """
+
+    async def probables(self, event_ids: list[str]) -> list[ProbablePitchers]: ...
+
+
 class FairValueModel(Protocol):
     def values_by_terms(
         self, priced: list[PricedOutcome], as_of: datetime
@@ -113,6 +142,15 @@ class ObservationStore(Protocol):
     def record_priced(self, priced: list[PricedOutcome], recorded_at: datetime) -> None: ...
     def record_opportunity(self, opportunity: Opportunity, at: datetime) -> None: ...
     def record_fill(self, fill: Fill) -> None: ...
+    # ADR-0008 alert-first paper tracking
+    def record_call(self, call: Call) -> None: ...
+    def record_call_snapshot(self, snap: CallSnapshot) -> None: ...
+    def record_paper_fill(self, fill: PaperFill) -> None: ...
+    # ADR-0008 part 2: grading
+    def record_manual_fill(self, fill: ManualFill) -> None: ...
+    def record_closing_line(self, line: ClosingLine) -> None: ...
+    def record_settlement(self, settlement: Settlement) -> None: ...
+    def record_call_grade(self, grade: CallGrade) -> None: ...
 
 
 class ExecutionVenue(Protocol):

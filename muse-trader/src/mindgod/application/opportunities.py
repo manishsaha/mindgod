@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_FLOOR, Decimal
 
 from mindgod.domain.fees import FeeModel
 from mindgod.domain.primitives import ContractPrice, Probability
@@ -37,6 +37,8 @@ class Opportunity:
     edge_net: Decimal  # per-contract expected profit, net of fee and slippage
     stake: Decimal
     refs: str = ""
+    limit_price: Decimal | None = None  # X: highest ask with edge, ADR-0008
+    depth_at_x: int = 0  # contracts available at or below X
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +66,46 @@ def _kelly_stake(
     if price <= 0 or price >= 1 or edge <= 0:
         return Decimal(0)
     return min(edge / (1 - price) * kelly_mult * bankroll, max_stake)
+
+
+def compute_limit_price(
+    fair: FairValue,
+    fees: FeeModel,
+    cfg: DetectorConfig,
+    contracts: int,
+    current_price: Decimal,
+) -> Decimal:
+    """Highest ask price X where net edge still clears the threshold.
+
+    ADR-0008: the alert states a price limit, not a price. X is computed with
+    the existing fee model, so the user can act without redoing math.
+    """
+    fair_p = Decimal(str(fair.probability.value))
+    se = Decimal(str(fair.standard_error))
+    threshold = cfg.min_net_edge + cfg.threshold_widening * se
+
+    def net_edge_at(p: Decimal) -> Decimal:
+        if p <= 0 or p >= 1:
+            return Decimal("-1")
+        fee_per = fees.taker_fee(ContractPrice(p), contracts) / contracts
+        return fair_p - p - fee_per - cfg.slippage
+
+    lo = current_price
+    hi = fair_p - threshold - cfg.slippage
+    if hi >= Decimal("1"):
+        hi = Decimal("0.99")
+    if hi <= lo:
+        return lo
+    # Binary search for max p with net_edge >= threshold
+    for _ in range(25):
+        mid = (lo + hi) / 2
+        if net_edge_at(mid) >= threshold:
+            lo = mid
+        else:
+            hi = mid
+    # Round down to the cent: X is a limit the user can actually hit
+    cents = (lo * 100).to_integral_value(rounding=ROUND_FLOOR)
+    return cents / 100
 
 
 def evaluate(
@@ -129,6 +171,10 @@ def evaluate(
     edge_net = fair_p - fill.average_price - fee / contracts - cfg.slippage
     if edge_net < threshold:
         return None
+    # ADR-0008: X is the highest ask where edge still clears the threshold.
+    # N is Kelly-sized contracts capped by depth at or below X.
+    limit_x = compute_limit_price(fair, fees, cfg, contracts, fill.average_price)
+    depth_at_x = sum(level.contracts for level in book.asks if level.price.dollars <= limit_x)
     return Opportunity(
         listing=listing.key,
         outcome=listing.outcome,
@@ -138,6 +184,8 @@ def evaluate(
         edge_net=edge_net,
         stake=Decimal(contracts) * fill.average_price,
         refs=refs,
+        limit_price=limit_x,
+        depth_at_x=depth_at_x,
     )
 
 

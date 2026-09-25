@@ -136,6 +136,13 @@ class FakeStore:
     def record_books(self, books, now): ...
     def record_opportunity(self, opportunity, at): ...
     def record_fill(self, fill): ...
+    def record_call(self, call): ...
+    def record_call_snapshot(self, snap): ...
+    def record_paper_fill(self, fill): ...
+    def record_manual_fill(self, fill): ...
+    def record_closing_line(self, line): ...
+    def record_settlement(self, settlement): ...
+    def record_call_grade(self, grade): ...
 
 
 def _listing_and_event():
@@ -283,6 +290,15 @@ def _book_at(key, price: str) -> OrderBook:
     )
 
 
+def _two_sided_book(key, ask: str, bid: str) -> OrderBook:
+    return OrderBook(
+        listing=key,
+        asks=(PriceLevel(ContractPrice(Decimal(ask)), 10),),
+        bids=(PriceLevel(ContractPrice(Decimal(bid)), 10),),
+        observed=Observation(NOW, NOW),
+    )
+
+
 def _fair_for(listing, event):
     outcome = spread(event, KC, Decimal("-3"))
     push = margin_exactly(event, KC, Decimal("3"))
@@ -298,22 +314,51 @@ def _fair_for(listing, event):
     return priced, {terms_key(Terms(Payoff(outcome, push))): {outcome: fair}}
 
 
-def test_move_check_suppresses_stale_consensus():
-    """The Kalshi mid moved 5c since the sportsbook refresh: the consensus
-    is stale, so the detector never runs and nothing is recorded."""
+def test_move_check_suppresses_move_away_from_fair():
+    """The mid moved away from fair value (widening the apparent edge): the
+    consensus is stale, so the detector never runs."""
     listing, event = _listing_and_event()
     priced, by_terms = _fair_for(listing, event)
-    ctx = _context(listing, event, [_book_at(listing.key, "0.52")], FakeModel(by_terms))
-    ctx.mid_at_refresh[listing.key] = 0.47
+    # fair=0.5, ref mid 0.50 -> mid 0.44: distance 0 -> 0.06, away 0.06 > 0.03
+    book = _two_sided_book(listing.key, "0.45", "0.43")
+    ctx = _context(listing, event, [book], FakeModel(by_terms))
+    ctx.mid_at_refresh[listing.key] = 0.50
     opps = asyncio.new_event_loop().run_until_complete(tick(ctx, priced))
     assert opps == []
     assert ctx.detector.seen == []
 
 
+def test_move_check_allows_move_toward_fair():
+    """A move toward fair value shrinks the edge on its own; it is not
+    evidence of a stale consensus."""
+    listing, event = _listing_and_event()
+    priced, by_terms = _fair_for(listing, event)
+    # fair=0.5, ref mid 0.44 -> mid 0.48: distance 0.06 -> 0.02, toward fair
+    book = _two_sided_book(listing.key, "0.49", "0.47")
+    ctx = _context(listing, event, [book], FakeModel(by_terms))
+    ctx.mid_at_refresh[listing.key] = 0.44
+    asyncio.new_event_loop().run_until_complete(tick(ctx, priced))
+    assert ctx.detector.seen != []
+
+
+def test_move_check_skips_on_wide_spread():
+    """On thin books the mid jumps with single orders; the spread gate skips
+    the check instead of false-suppressing."""
+    listing, event = _listing_and_event()
+    priced, by_terms = _fair_for(listing, event)
+    # fair=0.5, ref 0.50 -> mid 0.40 would suppress, but spread 0.10 > 0.06
+    book = _two_sided_book(listing.key, "0.45", "0.35")
+    ctx = _context(listing, event, [book], FakeModel(by_terms))
+    ctx.mid_at_refresh[listing.key] = 0.50
+    asyncio.new_event_loop().run_until_complete(tick(ctx, priced))
+    assert ctx.detector.seen != []
+
+
 def test_small_move_does_not_suppress():
     listing, event = _listing_and_event()
     priced, by_terms = _fair_for(listing, event)
-    ctx = _context(listing, event, [_book_at(listing.key, "0.48")], FakeModel(by_terms))
+    book = _two_sided_book(listing.key, "0.49", "0.47")
+    ctx = _context(listing, event, [book], FakeModel(by_terms))
     ctx.mid_at_refresh[listing.key] = 0.47
     asyncio.new_event_loop().run_until_complete(tick(ctx, priced))
     assert ctx.detector.seen != []
@@ -385,9 +430,11 @@ def test_notification_task_is_held_until_it_runs():
     assert ctx.notify_tasks == set()
 
 
-def test_mlb_moneyline_skipped_for_listed_pitchers():
-    """Neither feed reports listed pitchers, so an MLB moneyline's terms can
-    never be proven equal. The market is skipped loudly, not priced."""
+def test_mlb_moneyline_emitted_with_unknown_pitcher_rule():
+    """ADR-0009: MLB moneylines are emitted with UNKNOWN pitcher rule instead
+    of being skipped. The application decides compatibility."""
+    from mindgod.domain.terms import PitcherRule
+
     source = OddsApiSource("key")
     event = Event(
         id=event_id_for(League.MLB, "NYY", "BOS", "2026-10-05"),
@@ -405,4 +452,7 @@ def test_mlb_moneyline_skipped_for_listed_pitchers():
         ],
     }
     parsed = source._parse_market(League.MLB, event, DK, {"key": "draftkings"}, market, NOW)
-    assert parsed == []
+    # ADR-0009: no longer skipped; emitted with UNKNOWN pitcher rule
+    assert len(parsed) == 2
+    for priced in parsed:
+        assert priced.terms.void_policy.pitcher_rule == PitcherRule.UNKNOWN

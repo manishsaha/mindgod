@@ -1,7 +1,7 @@
 # ADR-0007: Stale-quote defenses
 
 Date: 2026-09-25
-Status: Accepted (revised 2026-09-25, see "Revision" below)
+Status: Accepted (revised 2026-09-25, see "Revision" below).
 
 ## Context
 

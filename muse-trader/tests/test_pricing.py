@@ -196,13 +196,13 @@ def test_lone_side_is_dropped_not_passed_through():
 def test_stale_quotes_are_dropped():
     from datetime import timedelta
 
-    old = NOW - timedelta(minutes=20)
+    old_recorded = NOW - timedelta(minutes=20)
     key = ListingKey(VenueId("draftkings"), "game", "h2h:nfl-kc")
     outcome = moneyline(GAME, KC)
     stale = PricedOutcome(
         outcome=outcome,
         listing_key=key,
-        quote=SportsbookQuote(key, -110, Observation(old, NOW)),
+        quote=SportsbookQuote(key, -110, Observation(NOW, old_recorded)),
         market_group="draftkings:game:h2h",
         terms=Terms(Payoff(outcome)),
     )
@@ -210,21 +210,54 @@ def test_stale_quotes_are_dropped():
     assert model.values_by_terms([stale], NOW) == {}
 
 
+def test_confirmation_age_gate_keeps_old_valid_at():
+    """A quote with an old valid_at but a fresh recorded_at is kept.
+
+    valid_at is the feed's last_update ("last changed"); a line that holds
+    steady looks old. Gating on it would drop the most settled lines.
+    """
+    from datetime import timedelta
+
+    old_valid = NOW - timedelta(minutes=20)
+    key = ListingKey(VenueId("draftkings"), "game", "h2h:nfl-kc")
+    kc_outcome = moneyline(GAME, KC)
+    buf_outcome = moneyline(GAME, BUF)
+    priced = [
+        PricedOutcome(
+            outcome=kc_outcome,
+            listing_key=key,
+            quote=SportsbookQuote(key, -110, Observation(old_valid, NOW)),
+            market_group="draftkings:game:h2h",
+            terms=Terms(Payoff(kc_outcome)),
+        ),
+        PricedOutcome(
+            outcome=buf_outcome,
+            listing_key=key,
+            quote=SportsbookQuote(key, -110, Observation(old_valid, NOW)),
+            market_group="draftkings:game:h2h",
+            terms=Terms(Payoff(buf_outcome)),
+        ),
+    ]
+    model = WeightedConsensusModel(max_quote_age_s=900)
+    values = model.values_by_terms(priced, NOW)
+    assert len(values) == 1
+
+
 def test_quote_age_widens_standard_error():
     from datetime import timedelta
 
-    aged_at = NOW - timedelta(minutes=10)
+    aged_recorded = NOW - timedelta(minutes=10)
     priced = []
     for book in ("draftkings", "fanduel"):
         key = ListingKey(VenueId(book), "game", f"h2h:{book}")
         for team in (KC, BUF):
             outcome = moneyline(GAME, team)
-            valid = aged_at if book == "fanduel" else NOW
+            recorded = aged_recorded if book == "fanduel" else NOW
             priced.append(
                 PricedOutcome(
                     outcome=outcome,
                     listing_key=key,
-                    quote=SportsbookQuote(key, -110, Observation(valid, NOW)),
+                    quote=SportsbookQuote(key, -110, Observation(NOW, recorded)),
                     market_group=f"{book}:game:h2h",
                     terms=Terms(Payoff(outcome)),
                 )
@@ -235,3 +268,33 @@ def test_quote_age_widens_standard_error():
     kc = moneyline(GAME, KC)
     # 10 minutes stale at 0.001/min beats the zero disagreement floor.
     assert fair[kc].standard_error == 0.01
+
+
+def test_age_term_combines_in_quadrature_with_production_floor():
+    """Production config hid the inert-age-term bug: max() made the age term
+    vanish under the 0.02 floor. Quadrature keeps it."""
+    import math
+    from datetime import timedelta
+
+    aged_recorded = NOW - timedelta(minutes=15)
+    priced = []
+    for book in ("draftkings", "fanduel"):
+        key = ListingKey(VenueId(book), "game", f"h2h:{book}")
+        for team in (KC, BUF):
+            outcome = moneyline(GAME, team)
+            priced.append(
+                PricedOutcome(
+                    outcome=outcome,
+                    listing_key=key,
+                    quote=SportsbookQuote(key, -110, Observation(NOW, aged_recorded)),
+                    market_group=f"{book}:game:h2h",
+                    terms=Terms(Payoff(outcome)),
+                )
+            )
+    model = WeightedConsensusModel(min_standard_error=0.02, stale_se_per_minute=0.001)
+    values = model.values_by_terms(priced, NOW)
+    fair = next(iter(values.values()))
+    kc = moneyline(GAME, KC)
+    expected = math.sqrt(0.02**2 + 0.015**2)
+    assert abs(fair[kc].standard_error - expected) < 1e-9
+    assert fair[kc].standard_error > 0.02

@@ -79,17 +79,18 @@ def build_context(
     )
 
     engine = settings.engine
+    detector_cfg = DetectorConfig(
+        bankroll=bankroll,
+        min_net_edge=Decimal(engine.min_net_edge),
+        kelly_fraction=Decimal(engine.kelly_fraction),
+        max_stake_per_bet=Decimal(engine.max_stake_per_bet),
+        slippage=Decimal(engine.slippage),
+        uncertainty_aversion=Decimal(engine.uncertainty_aversion),
+        threshold_widening=Decimal(engine.threshold_widening),
+    )
     detector = ValueDetector(
         fees,
-        DetectorConfig(
-            bankroll=bankroll,
-            min_net_edge=Decimal(engine.min_net_edge),
-            kelly_fraction=Decimal(engine.kelly_fraction),
-            max_stake_per_bet=Decimal(engine.max_stake_per_bet),
-            slippage=Decimal(engine.slippage),
-            uncertainty_aversion=Decimal(engine.uncertainty_aversion),
-            threshold_widening=Decimal(engine.threshold_widening),
-        ),
+        detector_cfg,
         refs="mindgod",
     )
 
@@ -111,6 +112,11 @@ def build_context(
         notifier=notifier,
         horizon_days=engine.horizon_days,
         max_kalshi_move=engine.max_kalshi_move,
+        move_check_max_spread=getattr(engine, "move_check_max_spread", 0.06),
+        fees=fees,
+        detector_cfg=detector_cfg,
+        reaction_delay_s=getattr(engine, "reaction_delay_s", 60),
+        pitcher_rule_se=getattr(settings.pricing, "pitcher_rule_se", 0.01),
     )
     return ctx, settings.polling
 

@@ -1,7 +1,7 @@
 # ADR-0009: MLB listed pitchers are an adjustable terms difference
 
 Date: 2026-09-25
-Status: Proposed. Supersedes the blanket MLB moneyline skip in `odds_api.py`.
+Status: Accepted. Supersedes the blanket MLB moneyline skip in `odds_api.py`. Implementation: complete.
 
 ## Context
 
@@ -31,9 +31,9 @@ and let the application decide.
 
    ```python
    class PitcherRule(StrEnum):
-       ACTION = "action"      # settles regardless of starters
-       LISTED = "listed"      # voids unless listed_pitchers both start
-       UNKNOWN = "unknown"    # the source does not say
+       ACTION = "action"  # settles regardless of starters
+       LISTED = "listed"  # voids unless listed_pitchers both start
+       UNKNOWN = "unknown"  # the source does not say
    ```
 
    `listed_pitchers` keeps the pitcher IDs when the rule is `LISTED`.
