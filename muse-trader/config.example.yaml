@@ -1,0 +1,41 @@
+# Copy to config.yaml and tune. All money values in USD.
+polling:
+  kalshi_interval_s: 60
+  polymarket_interval_s: 60
+  odds_api_interval_s: 300
+
+pricing:
+  devig_method: power        # additive | multiplicative | power
+  sharp_books: [pinnacle]    # weighted highest in consensus
+  sharp_weight: 3.0
+  book_weight: 1.0
+
+engine:
+  # Threshold on NET edge (after taker fee + slippage), not gross edge.
+  # A flat gross threshold is wrong: the taker fee peaks at 50c (~1.75c per
+  # contract) and shrinks toward the tails (~0.63c at 90c), so the minimum
+  # worthwhile gross edge is price-dependent. Gating on net edge handles it.
+  min_net_edge: 0.02
+  kelly_fraction: 0.25       # fractional Kelly
+  max_stake_per_bet: 100.0
+  max_exposure_per_event: 500.0
+  daily_loss_limit: 1000.0
+  slippage: 0.005            # assumed price slippage per contract
+
+# Venue taker-fee schedules. Kalshi: ceil(0.07 x contracts x price x (1-price))
+# per order. These change over time and differ across markets: keep them here.
+fees:
+  kalshi:
+    taker_rate: 0.07
+    round_up_cents: true
+  polymarket:
+    taker_rate: 0.03         # varies ~3% sports to ~7% crypto; verify per market
+    round_up_cents: false
+
+alerts:
+  cooldown_s: 900            # per market+side dedup window
+  min_edge_move: 0.01        # re-alert if edge moves this much
+
+execution:
+  mode: dry-run              # dry-run | paper | live
+  live_requires_flag: true   # live also needs --live on the command line
