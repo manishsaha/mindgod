@@ -23,6 +23,11 @@ helper inherited the bad fair value into no-side listings.
    lines carry no refund.
 2. The consensus model devigs inside terms partitions (`partition_by_terms`);
    a push-refunding line never informs a no-push line on the same outcome.
+   Devigging runs per market group *before* partitioning, so both sides of
+   a market are always devigged together no matter what their terms look
+   like; a terms bug can never silently switch the vig removal off. A
+   lone side is dropped, never passed through: one price carries the full
+   overround (see the 104.8% incident below).
 3. A listing uses a fair value only when `differences(book_terms,
    listing_terms)` is empty, checked at lookup time on the yes-basis
    outcome (refund rules are side-independent).
@@ -42,3 +47,20 @@ whole-number push-refunding lines are never treated as equivalent to them.
 - Tests: KC -3 regression (`test_no_fair_value_when_terms_differ`,
   `test_matching_terms_flow_through`), partition separation, and feed
   terms parsing in `tests/test_service.py`.
+
+## The 104.8% incident (2026-09-25)
+
+The spread push was built as `margin_exactly(team, abs(point))`. For the
+favorite that is right (KC -3 pushes when KC wins by 3), but for the
+underdog it described a different game: BUF +3 was recorded as pushing
+when BUF wins by 3, instead of when KC wins by 3. The two sides got
+different refund terms, `partition_by_terms` split the pair, and each lone
+side passed devigging through untouched: 52.38% + 52.38% = 104.8%, a
+built-in 2.4-point phantom edge from the vig alone.
+
+Fixed as `margin_exactly(team, -point)`, which canonicalizes (via the
+domain's home-minus-away normalization) to one refund outcome for both
+sides. The devig-before-partition ordering plus the lone-side drop mean
+this bug class now fails closed even if the terms are ever wrong again:
+split sides are dropped, never passed through with the vig intact.
+Regression: `test_underdog_push_terms_match_favorite`.

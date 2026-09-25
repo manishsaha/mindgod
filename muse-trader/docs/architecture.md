@@ -22,9 +22,12 @@ OddsApiSource.priced_outcomes()      sportsbook prices -> PricedOutcome,
         |                            each carrying its settlement Terms;
         |                            refreshed on its own cadence, failures
         |                            keep the previous prices
-WeightedConsensusModel.value()       devig per book-market *within each
-        |                            terms partition* -> dict[Outcome,
-        |                            FairValue]; partitions never mix
+WeightedConsensusModel.values_by_terms()  devig per book-market *before*
+        |                            terms partitioning -> dict[terms_key,
+        |                            dict[Outcome, FairValue]]; stale quotes
+        |                            dropped, lone sides dropped, age
+        |                            widens the error bar; partitions never
+        |                            mix
 KalshiExchange / PolymarketExchange  order books for registered listings
         |                            (Kalshi: batch /markets/orderbooks,
         |                            bids-only ladders, ask = 1 - other bid)
@@ -54,7 +57,17 @@ ExposureLimits -> execution (dry-run | paper | live-fails-closed)
   are built inside terms partitions and a listing only uses a fair value
   whose source terms are exactly its own. A 50% devig on KC -3 at -110 is
   conditional on no push; using it against a push-refunding Kalshi listing
-  invents edge that does not exist. See ADR-0005.
+  invents edge that does not exist. Devigging runs per market group before
+  partitioning (never the reverse), so a terms bug can never silently
+  switch the vig removal off; a lone side is dropped rather than passed
+  through with the vig intact. See ADR-0005.
+- **Stale quotes never become fair values.** Quotes older than
+  `pricing.max_quote_age_s` are dropped, aging quotes widen the standard
+  error, and an opportunity is suppressed when the exchange mid moved more
+  than `engine.max_kalshi_move` since the last sportsbook refresh. When
+  news breaks the exchange reprices in seconds while the consensus lags by
+  minutes; without these the system would flag the correct new price as
+  mispriced. See ADR-0007.
 - **Kalshi books are bids only.** `yes_dollars` / `no_dollars` hold resting
   bids, ascending, best last. The yes ask is `1 - best no bid`. Prices and
   counts are fixed-point strings; fractional counts floor to whole
