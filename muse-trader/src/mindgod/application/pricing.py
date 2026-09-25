@@ -6,6 +6,7 @@ pair sums to 1 + vig; a lone side carries no overround to remove and passes
 through), then books combine by configured weight into a FairValue carrying
 its standard error and lineage.
 """
+
 from __future__ import annotations
 
 import math
@@ -13,11 +14,75 @@ from collections import defaultdict
 from datetime import datetime
 
 from mindgod.domain.primitives import Probability
-from mindgod.domain.propositions import Outcome
+from mindgod.domain.propositions import Band, CategoryIs, Outcome, Threshold
+from mindgod.domain.terms import Terms
 from mindgod.domain.valuation import FairValue
 from mindgod.domain.venues import ListingKey, VenueId
 
 from .ports import PricedOutcome
+
+
+def outcome_key(outcome: Outcome) -> str:
+    """Stable storage key for an outcome.
+
+    repr(Outcome) changes whenever the dataclass changes; this serializes the
+    canonical structure instead, so stored rows stay joinable across refactors.
+    """
+    q = outcome.quantity
+    parts = [
+        q.league.value,
+        str(q.event_id),
+        q.stat.value,
+        q.period.value,
+        str(q.team_id) if q.team_id is not None else "",
+        str(q.player_id) if q.player_id is not None else "",
+    ]
+    cond = outcome.condition
+    if isinstance(cond, Threshold):
+        parts += ["threshold", cond.comparator.value, str(cond.line)]
+    elif isinstance(cond, Band):
+        parts += ["band", str(cond.lower), str(cond.upper)]
+    elif isinstance(cond, CategoryIs):
+        parts += ["category", cond.value]
+    else:  # pragma: no cover - the domain only has these three conditions
+        raise TypeError(f"unknown condition: {type(cond)}")
+    return "|".join(parts)
+
+
+def terms_key(terms: Terms) -> str:
+    """What the equal-terms rule compares: refund terms plus void policy.
+
+    The wins_if outcome is the key the fair value is looked up under, so it
+    is not part of this key. Two prices are directly comparable exactly when
+    their terms keys match, which is differences() restricted to the part
+    that is not already established by the outcome lookup.
+    """
+    refunds = terms.payoff.refunds_if
+    void = terms.void_policy
+    pitchers = ",".join(sorted(str(p) for p in void.listed_pitchers))
+    return "|".join(
+        [
+            outcome_key(refunds) if refunds is not None else "",
+            void.on_player_absent.value,
+            void.on_postponement.value,
+            pitchers,
+        ]
+    )
+
+
+def partition_by_terms(
+    priced: list[PricedOutcome],
+) -> dict[str, list[PricedOutcome]]:
+    """Group priced outcomes by settlement terms.
+
+    Devigging runs per market group inside each partition, so a
+    push-refunding whole-number book line never shares a consensus with a
+    no-push half-point line on the same canonical outcome.
+    """
+    groups: dict[str, list[PricedOutcome]] = defaultdict(list)
+    for p in priced:
+        groups[terms_key(p.terms)].append(p)
+    return groups
 
 
 def devig(probs: list[float], method: str = "power") -> list[float]:
@@ -80,23 +145,24 @@ class WeightedConsensusModel:
         method: str = "power",
         book_weights: dict[str, float] | None = None,
         default_weight: float = 1.0,
+        min_standard_error: float = 0.0,
     ) -> None:
         self._method = method
         self._book_weights = book_weights or {}
         self._default_weight = default_weight
+        # A single book gives a measured disagreement of 0, which drops the
+        # uncertainty penalty exactly when uncertainty is highest. The floor
+        # keeps one-book fair values honest.
+        self._min_standard_error = min_standard_error
 
     def _weight(self, venue_id: VenueId) -> float:
         return self._book_weights.get(str(venue_id), self._default_weight)
 
-    def value(
-        self, priced: list[PricedOutcome], as_of: datetime
-    ) -> dict[Outcome, FairValue]:
+    def value(self, priced: list[PricedOutcome], as_of: datetime) -> dict[Outcome, FairValue]:
         groups: dict[str, list[PricedOutcome]] = defaultdict(list)
         for p in priced:
             groups[p.market_group].append(p)
-        by_outcome: dict[Outcome, list[tuple[float, float, ListingKey]]] = defaultdict(
-            list
-        )
+        by_outcome: dict[Outcome, list[tuple[float, float, ListingKey]]] = defaultdict(list)
         for group in groups.values():
             implied = [p.quote.implied_probability.value for p in group]
             for p, fair in zip(group, devig(implied, self._method), strict=True):
@@ -106,10 +172,14 @@ class WeightedConsensusModel:
         result: dict[Outcome, FairValue] = {}
         for outcome, entries in by_outcome.items():
             prob = consensus([(f, w) for f, w, _ in entries])
+            se = max(
+                _weighted_std([(f, w) for f, w, _ in entries], prob),
+                self._min_standard_error,
+            )
             result[outcome] = FairValue(
                 outcome=outcome,
                 probability=Probability(prob),
-                standard_error=_weighted_std([(f, w) for f, w, _ in entries], prob),
+                standard_error=se,
                 as_of=as_of,
                 method=f"{self._method}-devig",
                 sources=tuple(key for _, _, key in entries),

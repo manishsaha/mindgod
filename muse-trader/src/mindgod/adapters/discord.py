@@ -3,6 +3,7 @@
 Discord is never in the critical path for fleeting edges (ADR-0003); it
 reports what the engine decided.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -68,8 +69,7 @@ class DiscordNotifier(Notifier):
                         },
                         {
                             "name": "Fair value",
-                            "value": f"{fair.probability.value:.1%} "
-                            f"(se {fair.standard_error:.3f})",
+                            "value": f"{fair.probability.value:.1%} (se {fair.standard_error:.3f})",
                             "inline": True,
                         },
                         {
@@ -104,9 +104,7 @@ class DiscordNotifier(Notifier):
         async with httpx.AsyncClient(timeout=15) as client:
             for _ in range(4):
                 try:
-                    resp = await client.post(
-                        self._webhook_url, json=self._payload(opp)
-                    )
+                    resp = await client.post(self._webhook_url, json=self._payload(opp))
                 except Exception:
                     log.exception("discord post failed")
                     return False

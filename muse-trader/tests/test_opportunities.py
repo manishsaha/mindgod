@@ -4,6 +4,7 @@ Each test protects the fee-aware gating behavior: the threshold applies to
 net edge because the taker fee is price-dependent (peaks at 50c, shrinks to
 the tails), and per-order round-up punishes tiny orders.
 """
+
 from datetime import UTC, datetime
 from decimal import Decimal as D
 
@@ -88,16 +89,8 @@ def test_round_up_kills_small_orders():
     """Same market and edge: a tiny order fails the net gate because the
     per-order round-up inflates its effective fee."""
     kw: dict = dict(min_net_edge=D("0.01"))
-    assert (
-        evaluate(
-            _listing(), _book("0.9"), _fair(0.92), FEES, _cfg(bankroll=D(10), **kw)
-        )
-        is None
-    )
-    assert (
-        evaluate(_listing(), _book("0.9"), _fair(0.92), FEES, _cfg(**kw))
-        is not None
-    )
+    assert evaluate(_listing(), _book("0.9"), _fair(0.92), FEES, _cfg(bankroll=D(10), **kw)) is None
+    assert evaluate(_listing(), _book("0.9"), _fair(0.92), FEES, _cfg(**kw)) is not None
 
 
 def test_no_signal_below_net_threshold():
@@ -120,9 +113,7 @@ def test_uncertainty_widens_the_gate():
     cfg = _cfg()
     assert evaluate(_listing(), _book("0.5"), _fair(0.6), FEES, cfg) is not None
     # se 0.05 widens the 0.02 gate to 0.12; the 0.0825 net edge no longer clears
-    assert (
-        evaluate(_listing(), _book("0.5"), _fair(0.6, se=0.05), FEES, cfg) is None
-    )
+    assert evaluate(_listing(), _book("0.5"), _fair(0.6, se=0.05), FEES, cfg) is None
 
 
 def test_uncertainty_shrinks_the_stake():
@@ -140,9 +131,7 @@ def test_no_side_uses_the_complement():
     assert outcome is not None
     listing = _listing(outcome=outcome, side="no")
     key = ListingKey(VenueId("kalshi"), "T1", "no")
-    detector = ValueDetector(
-        {VenueId("kalshi"): FEES}, _cfg(min_net_edge=D("0.01"))
-    )
+    detector = ValueDetector({VenueId("kalshi"): FEES}, _cfg(min_net_edge=D("0.01")))
     opps = detector.detect(
         [(listing, _book("0.35", key=key))],
         {moneyline(GAME, KC): _fair(0.6)},

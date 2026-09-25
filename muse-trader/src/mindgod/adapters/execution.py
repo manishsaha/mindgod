@@ -6,6 +6,7 @@ unless a live venue is constructed with live=True AND the config enables it;
 the live venues below fail closed until their order paths are implemented
 and explicitly authorized.
 """
+
 from __future__ import annotations
 
 import logging
@@ -13,6 +14,7 @@ from datetime import UTC, datetime
 
 from mindgod.application.opportunities import Opportunity
 from mindgod.application.ports import ExecutionVenue, Fill
+from mindgod.domain.venues import ListingKey
 
 log = logging.getLogger("mindgod.execution")
 
@@ -34,25 +36,48 @@ class DryRunExecution(ExecutionVenue):
 
 
 class PaperExecution(ExecutionVenue):
-    """Simulate fills at the estimated average price; track paper P&L."""
+    """Simulate fills at the estimated average price; track paper P&L.
+
+    Simulated liquidity is consumed. The detector caps each fill at the
+    depth it saw, so the largest requested fill is a lower bound on the
+    book's depth; fills accumulate against that bound per listing. Once the
+    simulated depth is exhausted, further fills wait for a deeper book.
+    Without this, every tick would refill the same contracts forever.
+    """
 
     name = "paper"
 
     def __init__(self) -> None:
         self.fills: list[Fill] = []
+        self._depth: dict[ListingKey, int] = {}
+        self._consumed: dict[ListingKey, int] = {}
 
     async def buy(self, opportunity: Opportunity) -> Fill | None:
+        key = opportunity.listing
+        want = opportunity.fill.contracts
+        known = self._depth.get(key, 0)
+        if want > known:
+            known = want
+            self._depth[key] = known
+        remaining = known - self._consumed.get(key, 0)
+        take = min(want, remaining)
+        if take <= 0:
+            log.info(
+                "PAPER no simulated depth left for %s; skipping",
+                key.market_id,
+            )
+            return None
         fill = Fill(
             listing=opportunity.listing,
             outcome=opportunity.outcome,
-            contracts=opportunity.fill.contracts,
+            contracts=take,
             fill_price=opportunity.fill.average_price,
             fee=opportunity.fee,
             live=False,
             at=datetime.now(UTC),
         )
         self.fills.append(fill)
-        key = opportunity.listing
+        self._consumed[key] = self._consumed.get(key, 0) + take
         log.info(
             "PAPER fill: %s %s %s contracts @ %s",
             key.side,
@@ -69,8 +94,9 @@ class KalshiExecution(ExecutionVenue):
     def __init__(self, live: bool = False) -> None:
         if live:
             raise RuntimeError(
-                "Live Kalshi trading is not wired yet: implement Ed25519 "
-                "signing and POST /portfolio/orders first."
+                "Live Kalshi trading is not wired yet: implement request "
+                "signing (RSA-PSS or Ed25519, key-dependent) and "
+                "POST /portfolio/orders first."
             )
 
     async def buy(self, opportunity: Opportunity) -> Fill | None:

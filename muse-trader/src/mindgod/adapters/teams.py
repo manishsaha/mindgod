@@ -3,6 +3,7 @@
 Keys are lowercase full names as returned by odds feeds. Adapters map them
 to abbreviations; canonical TeamIds are built as "<league>-<abbr>".
 """
+
 from __future__ import annotations
 
 from mindgod.domain.sports import League

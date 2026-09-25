@@ -4,6 +4,7 @@ Quotes are immutable facts stamped with an Observation (valid_at at the
 venue, recorded_at by us). We never update a stored quote, so as_of can
 reconstruct what we knew at any moment for honest backtests and CLV.
 """
+
 from __future__ import annotations
 
 import sqlite3
@@ -12,7 +13,9 @@ from typing import Any
 
 from mindgod.application.opportunities import Opportunity
 from mindgod.application.ports import Fill, ObservationStore, PricedOutcome
+from mindgod.application.pricing import outcome_key
 from mindgod.domain.quotes import OrderBook
+from mindgod.domain.venues import Listing
 
 
 class Store(ObservationStore):
@@ -62,8 +65,7 @@ class Store(ObservationStore):
                  live INTEGER NOT NULL)"""
         )
         self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS obs_lookup ON observations"
-            "(outcome, recorded_at)"
+            "CREATE INDEX IF NOT EXISTS obs_lookup ON observations(outcome, recorded_at)"
         )
         self._conn.commit()
 
@@ -96,8 +98,9 @@ class Store(ObservationStore):
             ),
         )
 
-    def record_books(self, books: list[OrderBook], recorded_at: datetime) -> None:
-        for book in books:
+    def record_books(self, books: list[tuple[Listing, OrderBook]], recorded_at: datetime) -> None:
+        for listing, book in books:
+            key = outcome_key(listing.outcome)
             for side, levels in (("ask", book.asks), ("bid", book.bids)):
                 for level in levels:
                     self._insert_observation(
@@ -106,16 +109,14 @@ class Store(ObservationStore):
                         venue=str(book.listing.venue_id),
                         market_id=book.listing.market_id,
                         side=f"{book.listing.side}:{side}",
-                        outcome="",
+                        outcome=key,
                         price=float(level.price.dollars),
                         contracts=level.contracts,
                         valid_at=book.observed.valid_at,
                     )
         self._conn.commit()
 
-    def record_priced(
-        self, priced: list[PricedOutcome], recorded_at: datetime
-    ) -> None:
+    def record_priced(self, priced: list[PricedOutcome], recorded_at: datetime) -> None:
         for p in priced:
             self._insert_observation(
                 recorded_at,
@@ -123,7 +124,7 @@ class Store(ObservationStore):
                 venue=str(p.listing_key.venue_id),
                 market_id=p.listing_key.market_id,
                 side=p.listing_key.side,
-                outcome=repr(p.outcome),
+                outcome=outcome_key(p.outcome),
                 price=p.quote.implied_probability.value,
                 contracts=0,
                 valid_at=p.quote.observed.valid_at,
@@ -140,7 +141,7 @@ class Store(ObservationStore):
                 str(opportunity.listing.venue_id),
                 opportunity.listing.market_id,
                 opportunity.listing.side,
-                repr(opportunity.outcome),
+                outcome_key(opportunity.outcome),
                 opportunity.fair_value.probability.value,
                 opportunity.fair_value.standard_error,
                 opportunity.fair_value.method,
@@ -162,7 +163,7 @@ class Store(ObservationStore):
                 str(fill.listing.venue_id),
                 fill.listing.market_id,
                 fill.listing.side,
-                repr(fill.outcome),
+                outcome_key(fill.outcome),
                 fill.contracts,
                 float(fill.fill_price),
                 float(fill.fee),
@@ -171,12 +172,12 @@ class Store(ObservationStore):
         )
         self._conn.commit()
 
-    def as_of(self, outcome_repr: str, ts: datetime) -> list[tuple[Any, ...]]:
-        """Latest observation rows known at `ts` for one outcome repr."""
+    def as_of(self, key: str, ts: datetime) -> list[tuple[Any, ...]]:
+        """Latest observation rows known at `ts` for one outcome key."""
         return self._conn.execute(
             "SELECT venue, market_id, side, price, contracts, valid_at,"
             " recorded_at FROM observations"
             " WHERE outcome = ? AND recorded_at <= ?"
             " ORDER BY recorded_at DESC LIMIT 50",
-            (outcome_repr, ts.isoformat()),
+            (key, ts.isoformat()),
         ).fetchall()

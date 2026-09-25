@@ -4,6 +4,7 @@ Positions on the same game are one correlated bet, so exposure is capped
 per event. Daily loss limits need settlement data to close positions and
 stay a documented gap until settlement feeds are wired.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

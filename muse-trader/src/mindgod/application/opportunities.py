@@ -12,6 +12,7 @@ gate on net edge, then size finally on net edge. Uncertainty widens the gate
 and shrinks the stake. Depth caps the size: we price the whole ladder, so the
 final edge is computed at the fill's average price, not the top of the book.
 """
+
 from __future__ import annotations
 
 from collections.abc import Mapping

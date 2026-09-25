@@ -3,6 +3,7 @@
 Adapters implement these protocols. The application depends only on these
 and the domain, never on concrete adapters.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from typing import TYPE_CHECKING, Protocol
 
 from mindgod.domain.propositions import Outcome
 from mindgod.domain.quotes import OrderBook, SportsbookQuote
+from mindgod.domain.terms import Terms
 from mindgod.domain.valuation import FairValue
 from mindgod.domain.venues import Listing, ListingKey, VenueId
 
@@ -24,13 +26,17 @@ class PricedOutcome:
     """A sportsbook price already translated to a canonical outcome.
 
     Adapters build the outcome with the builders in domain.propositions, so
-    equality with the outcomes that listings point at is structural.
+    equality with the outcomes that listings point at is structural. `terms`
+    carries the book's settlement terms (push/tie refunds, void policy): a
+    fair value may only use prices whose terms match the listing's, because
+    the same canonical outcome with different refund rules is a different bet.
     """
 
     outcome: Outcome
     listing_key: ListingKey
     quote: SportsbookQuote
     market_group: str  # outcomes devigged together, e.g. "draftkings:nfl-kc-buf:h2h"
+    terms: Terms
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,7 +69,15 @@ class SportsbookSource(Protocol):
 class ExchangeSource(Protocol):
     venue_id: VenueId
 
-    async def order_books(self, listings: list[Listing]) -> list[OrderBook]: ...
+    async def order_books(self, listings: list[Listing]) -> list[OrderBook]:
+        """One OrderBook per listing, in input order.
+
+        A listing whose book cannot be fetched yields an empty book (no
+        asks, no bids): no book, no trade. Adapters must keep the alignment;
+        the service pairs them positionally.
+        """
+        ...
+
     async def discover(self) -> list[UnmappedMarket]: ...
 
 
@@ -72,15 +86,14 @@ class ListingResolver(Protocol):
     def resolve(self, key: ListingKey) -> Listing | None: ...
     def listings_for(self, venue_id: VenueId) -> list[Listing]: ...
     def report_unmapped(self, market: UnmappedMarket) -> None: ...
+    def event_start(self, key: ListingKey) -> datetime | None: ...
 
     @property
     def review_queue(self) -> list[UnmappedMarket]: ...
 
 
 class FairValueModel(Protocol):
-    def value(
-        self, priced: list[PricedOutcome], as_of: datetime
-    ) -> dict[Outcome, FairValue]: ...
+    def value(self, priced: list[PricedOutcome], as_of: datetime) -> dict[Outcome, FairValue]: ...
 
 
 class OpportunityDetector(Protocol):
@@ -92,10 +105,10 @@ class OpportunityDetector(Protocol):
 
 
 class ObservationStore(Protocol):
-    def record_books(self, books: list[OrderBook], recorded_at: datetime) -> None: ...
-    def record_priced(
-        self, priced: list[PricedOutcome], recorded_at: datetime
+    def record_books(
+        self, books: list[tuple[Listing, OrderBook]], recorded_at: datetime
     ) -> None: ...
+    def record_priced(self, priced: list[PricedOutcome], recorded_at: datetime) -> None: ...
     def record_opportunity(self, opportunity: Opportunity, at: datetime) -> None: ...
     def record_fill(self, fill: Fill) -> None: ...
 

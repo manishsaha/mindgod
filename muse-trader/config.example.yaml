@@ -4,10 +4,17 @@
 
 polling:
   exchange_interval_s: 60
+  # The Odds API bills per request (markets x regions), so sportsbooks refresh
+  # on their own slower cadence. Discovery only feeds the review queue.
   sportsbook_interval_s: 300
+  discovery_interval_s: 3600
 
 pricing:
   devig_method: power  # additive | multiplicative | power (Shin: planned)
+  # Floor on the fair-value standard error: one book measures zero
+  # disagreement, which would drop the uncertainty penalty exactly when
+  # uncertainty is highest.
+  min_standard_error: 0.02
   book_weights:
     pinnacle: 3.0
     circa: 3.0
@@ -46,9 +53,11 @@ execution:
 
 # Registered markets. Explicit registration is the source of truth: tickers
 # here are mapped onto canonical outcomes with the proposition builders.
-# The `start` should match the odds feed's commence_time (minute precision)
-# so feed outcomes equal listing outcomes. Unregistered markets go to the
-# review queue and are never traded.
+# Event identity is league + teams + date + game_number (game_number tells
+# MLB doubleheaders apart); `start` is required and compared in UTC. If the
+# feed and the config disagree on the game number, the event ids stop
+# matching, nothing trades, and the service logs the drift. Unregistered
+# markets go to the review queue and are never traded.
 listings:
   # - venue: kalshi
   #   market_id: KXNFLGAME-26OCT05KCBUF
@@ -57,6 +66,7 @@ listings:
   #   home: KC
   #   away: BUF
   #   start: "2026-10-05T17:00:00Z"
+  #   game_number: 1  # MLB doubleheaders only
   #   outcome_kind: moneyline   # moneyline | spread | total
   #   outcome_team: home        # home | away
   #   # handicap: "-3.5"        # for spread

@@ -3,6 +3,7 @@
 Fee rates, edge thresholds, horizons, and risk limits are configuration,
 not code. They change over time and differ across markets.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
@@ -33,15 +34,19 @@ class EngineConfig:
 @dataclass(frozen=True, slots=True)
 class PricingConfig:
     devig_method: str = "power"
-    book_weights: dict[str, float] = field(
-        default_factory=lambda: {"pinnacle": 3.0}
-    )
+    book_weights: dict[str, float] = field(default_factory=lambda: {"pinnacle": 3.0})
+    # Floor on the fair-value standard error: a single book measures zero
+    # disagreement, which would drop the uncertainty penalty exactly when
+    # uncertainty is highest.
+    min_standard_error: float = 0.02
 
 
 @dataclass(frozen=True, slots=True)
 class PollingConfig:
     exchange_interval_s: int = 60
     sportsbook_interval_s: int = 300
+    # Discovery only feeds the human review queue; it never trades.
+    discovery_interval_s: int = 3600
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,12 +120,9 @@ def load_settings(path: str | Path | None = None) -> Settings:
         pricing=_build(PricingConfig, data.get("pricing")),
         engine=_build(EngineConfig, data.get("engine")),
         fees={
-            venue: _build(FeeModelConfig, cfg)
-            for venue, cfg in (data.get("fees") or {}).items()
+            venue: _build(FeeModelConfig, cfg) for venue, cfg in (data.get("fees") or {}).items()
         },
         alerts=_build(AlertsConfig, data.get("alerts")),
         execution=_build(ExecutionConfig, data.get("execution")),
-        listings=tuple(
-            _build(ListingSpec, spec) for spec in (data.get("listings") or [])
-        ),
+        listings=tuple(_build(ListingSpec, spec) for spec in (data.get("listings") or [])),
     )

@@ -3,6 +3,7 @@
 This is the only place that knows about concrete adapters. Everything else
 depends on ports and the domain.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -11,11 +12,11 @@ import logging
 import os
 from decimal import Decimal
 
-from mindgod.adapters.config import load_settings
+from mindgod.adapters.config import PollingConfig, load_settings
 from mindgod.adapters.discord import DiscordNotifier
 from mindgod.adapters.execution import make_execution
 from mindgod.adapters.kalshi import KalshiExchange
-from mindgod.adapters.listings import RegistryResolver, build_listing
+from mindgod.adapters.listings import RegistryResolver, build_event, build_listing
 from mindgod.adapters.odds_api import OddsApiSource
 from mindgod.adapters.polymarket import PolymarketExchange
 from mindgod.adapters.store import Store
@@ -32,13 +33,15 @@ log = logging.getLogger("mindgod")
 
 def build_context(
     config_path: str | None, bankroll: Decimal, live_flag: bool
-) -> tuple[ServiceContext, int]:
+) -> tuple[ServiceContext, PollingConfig]:
     settings = load_settings(config_path)
 
     resolver = RegistryResolver()
     token_ids: dict[str, str] = {}
     for spec in settings.listings:
-        resolver.register(build_listing(spec))
+        listing = build_listing(spec)
+        resolver.register(listing)
+        resolver.note_event(listing.key, build_event(spec))
         if spec.token_id:
             token_ids[spec.market_id] = spec.token_id
 
@@ -49,9 +52,7 @@ def build_context(
         VenueId("polymarket"): QuadraticFeeModel(Decimal("0.03"), Decimal("0")),
     }
     for venue, cfg in settings.fees.items():
-        fees[VenueId(venue)] = QuadraticFeeModel(
-            Decimal(cfg.taker_rate), Decimal(cfg.maker_rate)
-        )
+        fees[VenueId(venue)] = QuadraticFeeModel(Decimal(cfg.taker_rate), Decimal(cfg.maker_rate))
 
     kalshi = KalshiExchange()
     polymarket = PolymarketExchange(token_ids)
@@ -62,12 +63,8 @@ def build_context(
         log.warning("ODDS_API_KEY not set: running without sportsbook prices")
 
     execution: dict[VenueId, ExecutionVenue] = {
-        VenueId("kalshi"): make_execution(
-            settings.execution.mode, live_flag=live_flag
-        ),
-        VenueId("polymarket"): make_execution(
-            settings.execution.mode, live_flag=live_flag
-        ),
+        VenueId("kalshi"): make_execution(settings.execution.mode, live_flag=live_flag),
+        VenueId("polymarket"): make_execution(settings.execution.mode, live_flag=live_flag),
     }
 
     webhook = os.environ.get("DISCORD_WEBHOOK_URL", "")
@@ -104,15 +101,15 @@ def build_context(
         model=WeightedConsensusModel(
             method=settings.pricing.devig_method,
             book_weights=settings.pricing.book_weights,
+            min_standard_error=settings.pricing.min_standard_error,
         ),
         detector=detector,
-        risk=ExposureLimits(
-            max_exposure_per_event=Decimal(engine.max_exposure_per_event)
-        ),
-        store=Store(),
+        risk=ExposureLimits(max_exposure_per_event=Decimal(engine.max_exposure_per_event)),
+        store=Store(os.environ.get("MINDGOD_DB_PATH", "mindgod.db")),
         notifier=notifier,
+        horizon_days=engine.horizon_days,
     )
-    return ctx, settings.polling.exchange_interval_s
+    return ctx, settings.polling
 
 
 def main() -> None:
@@ -126,8 +123,15 @@ def main() -> None:
         help="required together with execution.mode=live for real orders",
     )
     args = parser.parse_args()
-    ctx, interval_s = build_context(args.config, Decimal(str(args.bankroll)), args.live)
-    asyncio.run(run_forever(ctx, interval_s))
+    ctx, polling = build_context(args.config, Decimal(str(args.bankroll)), args.live)
+    asyncio.run(
+        run_forever(
+            ctx,
+            exchange_interval_s=polling.exchange_interval_s,
+            sportsbook_interval_s=polling.sportsbook_interval_s,
+            discovery_interval_s=polling.discovery_interval_s,
+        )
+    )
 
 
 if __name__ == "__main__":

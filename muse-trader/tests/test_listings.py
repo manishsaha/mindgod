@@ -1,5 +1,8 @@
 """Listing registry tests: explicit registration, terms-change quarantine."""
+
 from datetime import UTC, datetime
+
+import pytest
 
 from mindgod.adapters.config import ListingSpec
 from mindgod.adapters.listings import RegistryResolver, build_event, build_listing
@@ -33,7 +36,36 @@ def test_builds_canonical_outcome():
     assert listing.key.venue_id == VenueId("kalshi")
 
 
+def test_event_identity_uses_date_and_game_number():
+    one = build_event(_spec(start="2026-10-05T17:00:00Z", game_number=1))
+    moved = build_event(_spec(start="2026-10-05T21:25:00Z", game_number=1))
+    second = build_event(_spec(start="2026-10-05T17:00:00Z", game_number=2))
+    assert one.id == moved.id  # flexed kickoff does not change identity
+    assert one.id != second.id  # doubleheader games stay distinct
+    assert "2026-10-05" in str(one.id)
+
+
 def test_no_side_complements_the_outcome():
+    spec = _spec(side="no")
+    listing = build_listing(spec)
+    event = build_event(spec)
+    assert listing.outcome == moneyline(event, TeamId("nfl-kc")).complement()
+
+
+def test_build_event_requires_a_parseable_start():
+    with pytest.raises(ValueError):
+        build_event(_spec(start=""))
+    with pytest.raises(ValueError):
+        build_event(_spec(start="not-a-date"))
+
+
+def test_note_event_remembers_starts():
+    resolver = RegistryResolver()
+    listing = build_listing(_spec())
+    event = build_event(_spec())
+    resolver.register(listing)
+    resolver.note_event(listing.key, event)
+    assert resolver.event_start(listing.key) == event.scheduled_start
     spec = _spec(side="no")
     listing = build_listing(spec)
     event = build_event(spec)
@@ -61,7 +93,10 @@ def test_terms_change_goes_to_review_not_overwrite():
 def test_report_unmapped_dedups():
     resolver = RegistryResolver()
     market = UnmappedMarket(
-        VenueId("kalshi"), "T9", "Some Game", datetime(2026, 10, 5, tzinfo=UTC),
+        VenueId("kalshi"),
+        "T9",
+        "Some Game",
+        datetime(2026, 10, 5, tzinfo=UTC),
         "unregistered ticker",
     )
     resolver.report_unmapped(market)

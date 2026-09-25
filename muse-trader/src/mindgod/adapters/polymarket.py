@@ -8,6 +8,7 @@ Polymarket US is a separate interface. Execution eligibility, fees, and API
 access need fresh verification before any live order. The live execution
 venue fails closed until then.
 """
+
 from __future__ import annotations
 
 import logging
@@ -42,12 +43,15 @@ def _levels(raw: list[Any]) -> tuple[PriceLevel, ...]:
     return tuple(levels)
 
 
+def _empty_book(key: ListingKey, now: datetime) -> OrderBook:
+    """No book, no trade: an empty book fails safe downstream."""
+    return OrderBook(listing=key, asks=(), bids=(), observed=Observation(now, now))
+
+
 def _to_book(key: ListingKey, data: dict[str, Any], now: datetime) -> OrderBook:
     asks = tuple(sorted(_levels(data.get("asks", [])), key=lambda lvl: lvl.price.dollars))
     bids = tuple(
-        sorted(
-            _levels(data.get("bids", [])), key=lambda lvl: lvl.price.dollars, reverse=True
-        )
+        sorted(_levels(data.get("bids", [])), key=lambda lvl: lvl.price.dollars, reverse=True)
     )
     return OrderBook(listing=key, asks=asks, bids=bids, observed=Observation(now, now))
 
@@ -64,21 +68,21 @@ class PolymarketExchange(ExchangeSource):
         async with httpx.AsyncClient(base_url=CLOB, timeout=15) as client:
             for listing in listings:
                 token_id = self._token_ids.get(listing.key.market_id)
+                now = datetime.now(UTC)
                 if not token_id:
                     log.warning(
-                        "no CLOB token id for %s; skipping",
+                        "no CLOB token id for %s; empty book",
                         listing.key.market_id,
                     )
+                    books.append(_empty_book(listing.key, now))
                     continue
-                now = datetime.now(UTC)
                 try:
                     resp = await client.get("/book", params={"token_id": token_id})
                     resp.raise_for_status()
                     books.append(_to_book(listing.key, resp.json(), now))
                 except Exception:
-                    log.exception(
-                        "polymarket book failed for %s", listing.key.market_id
-                    )
+                    log.exception("polymarket book failed for %s", listing.key.market_id)
+                    books.append(_empty_book(listing.key, now))
         return books
 
     async def discover(self) -> list[UnmappedMarket]:
