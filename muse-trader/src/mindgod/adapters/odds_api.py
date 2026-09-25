@@ -84,6 +84,7 @@ class OddsApiSource(SportsbookSource):
         self._sports = sports
         self._bookmakers = bookmakers
         self._markets = markets
+        self._mlb_warned: set[str] = set()
 
     async def priced_outcomes(self) -> list[PricedOutcome]:
         now = datetime.now(UTC)
@@ -194,10 +195,25 @@ class OddsApiSource(SportsbookSource):
         entry: dict[str, Any],
     ) -> tuple[Outcome, str, Terms] | None:
         name = str(entry.get("name", ""))
+        refunds: Outcome | None = None
         if market_key == "h2h":
             abbr = team_abbr(league, name)
             team = _team_for_abbr(event, abbr)
             if team is None:
+                return None
+            if league is League.MLB:
+                # Sportsbooks settle MLB moneylines on listed pitchers (both
+                # scheduled starters must throw); neither feed reports the
+                # pitchers, so the terms can never be proven equal. Skip the
+                # market loudly instead of trading a hidden mismatch.
+                eid = str(event.id)
+                if eid not in self._mlb_warned:
+                    self._mlb_warned.add(eid)
+                    log.warning(
+                        "skipping MLB moneyline for %s: listed-pitcher terms "
+                        "are not captured by either feed",
+                        eid,
+                    )
                 return None
             outcome = moneyline(event, team)
             # NFL games can tie: the book refunds the stake. MLB games play
@@ -212,8 +228,12 @@ class OddsApiSource(SportsbookSource):
             point = Decimal(str(entry["point"]))
             outcome = spread(event, team, point)
             # A whole-number line pushes at exactly the line: the book
-            # refunds. A half-point line cannot push.
-            refunds = margin_exactly(event, team, abs(point)) if _whole(point) else None
+            # refunds. A half-point line cannot push. The push margin is
+            # -point from the bet side's perspective: KC -3 pushes when KC
+            # wins by 3, and BUF +3 pushes on that same game (BUF wins by
+            # -3), so both sides must carry identical refund terms or the
+            # pair can never be devigged together.
+            refunds = margin_exactly(event, team, -point) if _whole(point) else None
             return outcome, str(abbr), Terms(Payoff(outcome, refunds))
         if market_key == "totals":
             if "point" not in entry:

@@ -93,7 +93,9 @@ class ListingResolver(Protocol):
 
 
 class FairValueModel(Protocol):
-    def value(self, priced: list[PricedOutcome], as_of: datetime) -> dict[Outcome, FairValue]: ...
+    def values_by_terms(
+        self, priced: list[PricedOutcome], as_of: datetime
+    ) -> dict[str, dict[Outcome, FairValue]]: ...
 
 
 class OpportunityDetector(Protocol):

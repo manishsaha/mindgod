@@ -124,6 +124,12 @@ def _chunks(items: list[str], size: int) -> Iterator[list[str]]:
 class KalshiExchange(ExchangeSource):
     venue_id = VenueId("kalshi")
 
+    def __init__(self, series_tickers: tuple[str, ...] = ("KXNFLGAME", "KXMLBGAME")) -> None:
+        # Discovery only feeds the human review queue, but an unfiltered
+        # /markets pull returns every kind of market. Restrict to the series
+        # we actually price.
+        self._series_tickers = series_tickers
+
     async def order_books(self, listings: list[Listing]) -> list[OrderBook]:
         now = datetime.now(UTC)
         if not listings:
@@ -171,11 +177,16 @@ class KalshiExchange(ExchangeSource):
 
     async def discover(self) -> list[UnmappedMarket]:
         now = datetime.now(UTC)
+        markets: list[dict[str, Any]] = []
         try:
             async with httpx.AsyncClient(base_url=BASE, timeout=15) as client:
-                resp = await client.get("/markets", params={"limit": 200})
-                resp.raise_for_status()
-                markets = resp.json().get("markets", [])
+                for series in self._series_tickers:
+                    resp = await client.get(
+                        "/markets", params={"limit": 200, "series_ticker": series}
+                    )
+                    resp.raise_for_status()
+                    batch = resp.json().get("markets", [])
+                    markets.extend(batch if isinstance(batch, list) else [])
         except Exception:
             log.exception("kalshi discovery failed")
             return []

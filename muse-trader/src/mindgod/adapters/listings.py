@@ -109,9 +109,11 @@ def build_terms(spec: ListingSpec, event: Event, outcome: Outcome) -> Terms:
     elif spec.outcome_kind == "spread":
         # A whole-number line pushes at exactly the line: the listing settles
         # like the book does, or the terms can never match a fair value.
+        # The push margin is -handicap from the bet side's perspective, so
+        # both sides of the same line share one refund outcome.
         handicap = Decimal(spec.handicap)
         if handicap == handicap.to_integral_value():
-            refunds = margin_exactly(event, team, abs(handicap))
+            refunds = margin_exactly(event, team, -handicap)
     elif spec.outcome_kind == "total":
         line = Decimal(spec.total_line)
         if line == line.to_integral_value():

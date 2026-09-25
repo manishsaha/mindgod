@@ -1,16 +1,23 @@
 """Fair-value models: devig sportsbook prices into consensus probabilities.
 
 Devig methods are pluggable strategies, chosen empirically per sport and
-market type. Each book's outcome set is devigged on its own (a book's h2h
-pair sums to 1 + vig; a lone side carries no overround to remove and passes
-through), then books combine by configured weight into a FairValue carrying
-its standard error and lineage.
+market type. The pipeline is: devig each book's outcome set on its own, then
+partition the devigged prices by settlement terms, then weight books into a
+FairValue carrying its standard error and lineage.
+
+Devigging runs per market group *before* terms partitioning on purpose: a
+terms bug must never be able to silently switch the vig removal off. A lone
+side is dropped, never passed through: one price carries the full overround
+and there is nothing to remove it against.
 """
 
 from __future__ import annotations
 
+import logging
 import math
 from collections import defaultdict
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 
 from mindgod.domain.primitives import Probability
@@ -20,6 +27,8 @@ from mindgod.domain.valuation import FairValue
 from mindgod.domain.venues import ListingKey, VenueId
 
 from .ports import PricedOutcome
+
+log = logging.getLogger("mindgod.pricing")
 
 
 def outcome_key(outcome: Outcome) -> str:
@@ -90,11 +99,14 @@ def devig(probs: list[float], method: str = "power") -> list[float]:
 
     Methods: additive (split overround evenly), multiplicative (scale down),
     power (Lopez exponent fit, the standard for two-outcome markets).
+
+    A lone side is refused, not passed through: one price carries the full
+    overround, so "devigging" it would bake the vig into the fair value.
     """
     if not probs or any(p <= 0 for p in probs):
         raise ValueError("probabilities must be positive")
     if len(probs) == 1:
-        return list(probs)
+        raise ValueError("cannot devig a lone side: one price carries the full overround")
     if method == "additive":
         overround = sum(probs) - 1.0
         return [p - overround / len(probs) for p in probs]
@@ -137,6 +149,79 @@ def _weighted_std(entries: list[tuple[float, float]], mean: float) -> float:
     return math.sqrt(var)
 
 
+@dataclass(frozen=True, slots=True)
+class DeviggedPrice:
+    """One book's fair probability for an outcome, vig removed.
+
+    Devigging runs per market group before terms partitioning, so both sides
+    of a market are always devigged together no matter what their terms look
+    like. `age_s` is how stale the quote was when the fair value was built;
+    staleness widens the error bar instead of silently passing as fresh.
+    """
+
+    outcome: Outcome
+    listing_key: ListingKey
+    fair_probability: float
+    weight: float
+    terms: Terms
+    age_s: float
+
+
+def devig_market_groups(
+    priced: list[PricedOutcome],
+    method: str,
+    weight_of: Callable[[VenueId], float],
+    as_of: datetime,
+    max_quote_age_s: float,
+) -> list[DeviggedPrice]:
+    """Devig each market group on its own, before terms partitioning.
+
+    Quotes older than `max_quote_age_s` are dropped: a stale quote compared
+    against a live exchange book manufactures fake edges. Market groups left
+    with a lone side are dropped too: one price carries the full overround.
+    """
+    groups: dict[str, list[PricedOutcome]] = defaultdict(list)
+    for p in priced:
+        age = (as_of - p.quote.observed.valid_at).total_seconds()
+        if age > max_quote_age_s:
+            log.warning(
+                "dropping quote older than %.0fs: %s (age %.0fs)",
+                max_quote_age_s,
+                p.listing_key,
+                age,
+            )
+            continue
+        groups[p.market_group].append(p)
+    out: list[DeviggedPrice] = []
+    for name, group in groups.items():
+        if len(group) < 2:
+            log.warning(
+                "dropping lone side in market group %s: %s carries the full overround",
+                name,
+                group[0].listing_key,
+            )
+            continue
+        if len({terms_key(p.terms) for p in group}) > 1:
+            log.error(
+                "market group %s mixes settlement terms; devigging together anyway",
+                name,
+            )
+        implied = [p.quote.implied_probability.value for p in group]
+        for p, fair in zip(group, devig(implied, method), strict=True):
+            age = max(0.0, (as_of - p.quote.observed.valid_at).total_seconds())
+            out.append(
+                DeviggedPrice(
+                    outcome=p.outcome,
+                    listing_key=p.listing_key,
+                    fair_probability=fair,
+                    weight=weight_of(p.listing_key.venue_id),
+                    terms=p.terms,
+                    age_s=age,
+                )
+            )
+    return out
+
+
 class WeightedConsensusModel:
     """The FairValueModel: devig per book-market, weight books, add error bars."""
 
@@ -146,6 +231,8 @@ class WeightedConsensusModel:
         book_weights: dict[str, float] | None = None,
         default_weight: float = 1.0,
         min_standard_error: float = 0.0,
+        max_quote_age_s: float = 900.0,
+        stale_se_per_minute: float = 0.001,
     ) -> None:
         self._method = method
         self._book_weights = book_weights or {}
@@ -154,34 +241,51 @@ class WeightedConsensusModel:
         # uncertainty penalty exactly when uncertainty is highest. The floor
         # keeps one-book fair values honest.
         self._min_standard_error = min_standard_error
+        # Quotes older than this never become fair values: comparing a stale
+        # consensus against a live book is the stale-quote edge in reverse.
+        self._max_quote_age_s = max_quote_age_s
+        # ...and quotes approaching the gate carry a wider error bar, so an
+        # aging consensus is penalized before it is dropped.
+        self._stale_se_per_minute = stale_se_per_minute
 
     def _weight(self, venue_id: VenueId) -> float:
         return self._book_weights.get(str(venue_id), self._default_weight)
 
-    def value(self, priced: list[PricedOutcome], as_of: datetime) -> dict[Outcome, FairValue]:
-        groups: dict[str, list[PricedOutcome]] = defaultdict(list)
-        for p in priced:
-            groups[p.market_group].append(p)
-        by_outcome: dict[Outcome, list[tuple[float, float, ListingKey]]] = defaultdict(list)
-        for group in groups.values():
-            implied = [p.quote.implied_probability.value for p in group]
-            for p, fair in zip(group, devig(implied, self._method), strict=True):
-                by_outcome[p.outcome].append(
-                    (fair, self._weight(p.listing_key.venue_id), p.listing_key)
+    def values_by_terms(
+        self, priced: list[PricedOutcome], as_of: datetime
+    ) -> dict[str, dict[Outcome, FairValue]]:
+        """Fair values keyed by terms key, then outcome.
+
+        Devigging already ran per market group, so each partition only does
+        the cross-book consensus: a push-refunding whole-number line never
+        informs a no-push listing's fair value.
+        """
+        devigged = devig_market_groups(
+            priced, self._method, self._weight, as_of, self._max_quote_age_s
+        )
+        partitions: dict[str, list[DeviggedPrice]] = defaultdict(list)
+        for d in devigged:
+            partitions[terms_key(d.terms)].append(d)
+        result: dict[str, dict[Outcome, FairValue]] = {}
+        for key, bucket in partitions.items():
+            by_outcome: dict[Outcome, list[DeviggedPrice]] = defaultdict(list)
+            for d in bucket:
+                by_outcome[d.outcome].append(d)
+            fair_values: dict[Outcome, FairValue] = {}
+            for outcome, entries in by_outcome.items():
+                prob = consensus([(e.fair_probability, e.weight) for e in entries])
+                se = max(
+                    _weighted_std([(e.fair_probability, e.weight) for e in entries], prob),
+                    self._min_standard_error,
+                    max(e.age_s for e in entries) / 60.0 * self._stale_se_per_minute,
                 )
-        result: dict[Outcome, FairValue] = {}
-        for outcome, entries in by_outcome.items():
-            prob = consensus([(f, w) for f, w, _ in entries])
-            se = max(
-                _weighted_std([(f, w) for f, w, _ in entries], prob),
-                self._min_standard_error,
-            )
-            result[outcome] = FairValue(
-                outcome=outcome,
-                probability=Probability(prob),
-                standard_error=se,
-                as_of=as_of,
-                method=f"{self._method}-devig",
-                sources=tuple(key for _, _, key in entries),
-            )
+                fair_values[outcome] = FairValue(
+                    outcome=outcome,
+                    probability=Probability(prob),
+                    standard_error=se,
+                    as_of=as_of,
+                    method=f"{self._method}-devig",
+                    sources=tuple(e.listing_key for e in entries),
+                )
+            result[key] = fair_values
         return result

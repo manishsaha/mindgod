@@ -54,7 +54,7 @@ def build_context(
     for venue, cfg in settings.fees.items():
         fees[VenueId(venue)] = QuadraticFeeModel(Decimal(cfg.taker_rate), Decimal(cfg.maker_rate))
 
-    kalshi = KalshiExchange()
+    kalshi = KalshiExchange(tuple(settings.engine.kalshi_discovery_series))
     polymarket = PolymarketExchange(token_ids)
 
     odds_key = os.environ.get("ODDS_API_KEY", "")
@@ -102,12 +102,15 @@ def build_context(
             method=settings.pricing.devig_method,
             book_weights=settings.pricing.book_weights,
             min_standard_error=settings.pricing.min_standard_error,
+            max_quote_age_s=settings.pricing.max_quote_age_s,
+            stale_se_per_minute=settings.pricing.stale_se_per_minute,
         ),
         detector=detector,
         risk=ExposureLimits(max_exposure_per_event=Decimal(engine.max_exposure_per_event)),
         store=Store(os.environ.get("MINDGOD_DB_PATH", "mindgod.db")),
         notifier=notifier,
         horizon_days=engine.horizon_days,
+        max_kalshi_move=engine.max_kalshi_move,
     )
     return ctx, settings.polling
 

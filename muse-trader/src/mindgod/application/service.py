@@ -18,11 +18,12 @@ import asyncio
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
+from mindgod.domain.quotes import OrderBook
 from mindgod.domain.terms import Payoff, Terms
-from mindgod.domain.venues import VenueId
+from mindgod.domain.venues import ListingKey, VenueId
 
 from .opportunities import Opportunity
 from .ports import (
@@ -36,7 +37,7 @@ from .ports import (
     PricedOutcome,
     SportsbookSource,
 )
-from .pricing import partition_by_terms, terms_key
+from .pricing import terms_key
 from .risk import RiskPolicy
 
 log = logging.getLogger("mindgod.service")
@@ -61,6 +62,17 @@ class ServiceContext:
     store: ObservationStore
     notifier: Notifier | None = None
     horizon_days: int = 7
+    # Move check: suppress an opportunity when the exchange mid moved more
+    # than this (in probability) since the sportsbook prices were refreshed.
+    # News reprices the exchange in seconds while the consensus lags by
+    # minutes; without the check we would flag the correct new price as
+    # mispriced.
+    max_kalshi_move: float = 0.03
+    mid_at_refresh: dict[ListingKey, float] = field(default_factory=dict)
+    sportsbook_refreshed: bool = False
+    # Notification tasks are held here so the event loop cannot garbage
+    # collect a fire-and-forget send before it runs.
+    notify_tasks: set[asyncio.Task[None]] = field(default_factory=set)
 
 
 async def _notify_safely(notifier: Notifier, opp: Opportunity) -> None:
@@ -70,14 +82,32 @@ async def _notify_safely(notifier: Notifier, opp: Opportunity) -> None:
         log.exception("discord notify failed for %s", opp.listing)
 
 
+def _spawn_notify(ctx: ServiceContext, notifier: Notifier, opp: Opportunity) -> None:
+    """Fire-and-forget without the garbage collector eating the task."""
+    task = asyncio.create_task(_notify_safely(notifier, opp))
+    ctx.notify_tasks.add(task)
+    task.add_done_callback(ctx.notify_tasks.discard)
+
+
+def _mid_price(book: OrderBook) -> float | None:
+    """Best-bid/best-ask mid in probability, or None for an empty book."""
+    ask = book.asks[0].price.dollars if book.asks else None
+    bid = book.bids[0].price.dollars if book.bids else None
+    if ask is not None and bid is not None:
+        return float((ask + bid) / 2)
+    if ask is not None:
+        return float(ask)
+    if bid is not None:
+        return float(bid)
+    return None
+
+
 async def tick(ctx: ServiceContext, priced: list[PricedOutcome]) -> list[Opportunity]:
     now = datetime.now(UTC)
     ctx.store.record_priced(priced, now)
-    # Devig runs inside each terms partition, so consensus never mixes a
-    # push-refunding book line with a no-push line on the same outcome.
-    fair_by_terms = {
-        key: ctx.model.value(bucket, now) for key, bucket in partition_by_terms(priced).items()
-    }
+    # Devigging ran per market group inside the model; the partitions here
+    # only keep a push-refunding book line from informing a no-push listing.
+    fair_by_terms = ctx.model.values_by_terms(priced, now)
 
     listing_event_ids: set[str] = set()
     for exchange in ctx.exchanges:
@@ -105,6 +135,13 @@ async def tick(ctx: ServiceContext, priced: list[PricedOutcome]) -> list[Opportu
             [(listing, book) for listing, book in zip(listings, books, strict=True)],
             now,
         )
+        if ctx.sportsbook_refreshed:
+            # Anchor for the move check: the exchange mid at the moment the
+            # fresh sportsbook prices arrived.
+            for listing, book in zip(listings, books, strict=True):
+                mid = _mid_price(book)
+                if mid is not None:
+                    ctx.mid_at_refresh[listing.key] = mid
         known = []
         for listing, book in zip(listings, books, strict=True):
             start = ctx.resolver.event_start(listing.key)
@@ -112,6 +149,16 @@ async def tick(ctx: ServiceContext, priced: list[PricedOutcome]) -> list[Opportu
                 continue
             known.append((listing, book))
         for listing, book in known:
+            ref_mid = ctx.mid_at_refresh.get(listing.key)
+            mid = _mid_price(book)
+            if ref_mid is not None and mid is not None and abs(mid - ref_mid) > ctx.max_kalshi_move:
+                log.info(
+                    "suppressing %s: exchange mid moved %.3f since the sportsbook"
+                    " refresh; the consensus is stale",
+                    listing.key,
+                    abs(mid - ref_mid),
+                )
+                continue
             # Books price the yes side; a no-side listing's fair value is the
             # complement, built by the detector from the yes fair value. The
             # terms check runs on the yes basis: the refund rules are what
@@ -150,7 +197,8 @@ async def tick(ctx: ServiceContext, priced: list[PricedOutcome]) -> list[Opportu
                     ctx.risk.record_fill(fill)
                 # Notify after execution, off the critical path.
                 if ctx.notifier is not None:
-                    asyncio.create_task(_notify_safely(ctx.notifier, opp))
+                    _spawn_notify(ctx, ctx.notifier, opp)
+    ctx.sportsbook_refreshed = False
     if ctx.resolver.review_queue:
         log.info("%d markets awaiting review", len(ctx.resolver.review_queue))
     return found
@@ -180,6 +228,7 @@ async def run_forever(
             if ctx.sportsbook is not None and now_ts - last_sportsbook >= sportsbook_interval_s:
                 try:
                     priced = await ctx.sportsbook.priced_outcomes()
+                    ctx.sportsbook_refreshed = True
                     last_sportsbook = now_ts
                 except Exception:
                     log.exception(

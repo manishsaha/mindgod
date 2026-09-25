@@ -29,6 +29,12 @@ class EngineConfig:
     uncertainty_aversion: str = "10.0"
     threshold_widening: str = "2.0"
     horizon_days: int = 7
+    # Move check: suppress an opportunity when the exchange mid moved more
+    # than this (probability) since the last sportsbook refresh.
+    max_kalshi_move: float = 0.03
+    # Discovery only feeds the review queue; restrict it to the series we
+    # actually price instead of pulling every kind of market.
+    kalshi_discovery_series: list[str] = field(default_factory=lambda: ["KXNFLGAME", "KXMLBGAME"])
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +45,10 @@ class PricingConfig:
     # disagreement, which would drop the uncertainty penalty exactly when
     # uncertainty is highest.
     min_standard_error: float = 0.02
+    # Freshness: quotes older than this never become fair values, and quotes
+    # approaching the gate widen the error bar by stale_se_per_minute.
+    max_quote_age_s: int = 900
+    stale_se_per_minute: float = 0.001
 
 
 @dataclass(frozen=True, slots=True)

@@ -102,3 +102,21 @@ def test_report_unmapped_dedups():
     resolver.report_unmapped(market)
     resolver.report_unmapped(market)
     assert len(resolver.review_queue) == 1
+
+
+def test_underdog_spread_push_matches_favorite():
+    """build_terms on the underdog side: BUF +3 refunds exactly when KC
+    wins by 3, the same refund outcome the favorite's -3 carries."""
+    from decimal import Decimal
+
+    from mindgod.adapters.listings import build_outcome, build_terms
+    from mindgod.domain.propositions import margin_exactly
+
+    fav_spec = _spec(outcome_kind="spread", outcome_team="home", handicap="-3")
+    dog_spec = _spec(outcome_kind="spread", outcome_team="away", handicap="3")
+    event = build_event(fav_spec)
+    fav_terms = build_terms(fav_spec, event, build_outcome(fav_spec, event))
+    dog_terms = build_terms(dog_spec, event, build_outcome(dog_spec, event))
+    push = margin_exactly(event, TeamId("nfl-kc"), Decimal("3"))
+    assert fav_terms.payoff.refunds_if == push
+    assert dog_terms.payoff.refunds_if == push

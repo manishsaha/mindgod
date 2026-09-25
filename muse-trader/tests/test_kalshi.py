@@ -123,3 +123,35 @@ def test_batch_params_use_repeated_tickers():
     )
     assert seen["path"] == "/markets/orderbooks"
     assert seen["params"] == [("tickers", "A"), ("tickers", "B")]
+
+
+def test_discovery_filters_by_series(monkeypatch):
+    seen: list = []
+
+    class FakeResp:
+        def raise_for_status(self): ...
+        def json(self):
+            return {"markets": [{"ticker": "T1", "title": "game"}]}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs): ...
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, path, params=None):
+            seen.append((path, params))
+            return FakeResp()
+
+    monkeypatch.setattr(kalshi.httpx, "AsyncClient", FakeClient)
+    exchange = kalshi.KalshiExchange(series_tickers=("KXNFLGAME", "KXMLBGAME"))
+    import asyncio
+
+    out = asyncio.new_event_loop().run_until_complete(exchange.discover())
+    assert seen == [
+        ("/markets", {"limit": 200, "series_ticker": "KXNFLGAME"}),
+        ("/markets", {"limit": 200, "series_ticker": "KXMLBGAME"}),
+    ]
+    assert [m.market_id for m in out] == ["T1", "T1"]

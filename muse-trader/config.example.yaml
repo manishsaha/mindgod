@@ -15,6 +15,10 @@ pricing:
   # disagreement, which would drop the uncertainty penalty exactly when
   # uncertainty is highest.
   min_standard_error: 0.02
+  # Quotes older than this never become fair values; quotes approaching the
+  # gate widen the error bar by stale_se_per_minute per minute of age.
+  max_quote_age_s: 900
+  stale_se_per_minute: 0.001
   book_weights:
     pinnacle: 3.0
     circa: 3.0
@@ -36,6 +40,13 @@ engine:
   threshold_widening: "2.0"
   # Only positions settling within this horizon (principles section 7).
   horizon_days: 7
+  # Suppress an opportunity when the exchange mid moved more than this
+  # (probability) since the last sportsbook refresh: news reprices the
+  # exchange in seconds while the consensus lags by minutes.
+  max_kalshi_move: 0.03
+  # Discovery only feeds the human review queue; restrict it to the series
+  # we actually price.
+  kalshi_discovery_series: ["KXNFLGAME", "KXMLBGAME"]
 
 fees:
   # Kalshi's published form: ceil(rate * contracts * P * (1 - P)) per order.
