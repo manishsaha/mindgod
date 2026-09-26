@@ -18,14 +18,21 @@ from decimal import Decimal
 
 import pytest
 
+import mindgod.application.calls as calls_mod
 from mindgod.adapters.store import Store
-from mindgod.application.calls import Call, PaperFill
+from mindgod.application.calls import (
+    CALL_GRADE_METHOD_VERSION,
+    Call,
+    PaperFill,
+    Settlement,
+)
 from mindgod.application.ports import ListingKey, PricedOutcome
 from mindgod.application.pricing import WeightedConsensusModel, devig, outcome_key
 from mindgod.application.service import (
     ServiceContext,
     _check_settlements,
     capture_closing_lines,
+    grade_pending_calls,
 )
 from mindgod.domain.primitives import Observation, Probability
 from mindgod.domain.propositions import spread
@@ -317,7 +324,9 @@ def test_full_cycle_settlement_and_grade():
     Uses the real production path throughout: the real capture_closing_lines
     (lopsided -150/+130 quotes, so the close is not symmetric), the real
     _check_settlements against a fake Kalshi exchange returning a batched
-    result, and the real _grade_settled_call via the tested grade_call().
+    result (which must NOT grade as a side effect), then the real
+    grade_pending_calls step, and the real _grade_settled_call via the tested
+    grade_call().
 
     Asserts the persisted grade's CLV equals
     close - reaction fill price - fee per contract, and that the instant
@@ -395,11 +404,18 @@ def test_full_cycle_settlement_and_grade():
     close_prob = close["sharp_close_prob"]
 
     # Settlement: fake Kalshi returns a batched "yes" result for the market.
+    # Settlement records the fact only; it must NOT grade as a side effect.
     exchange = ctx.exchanges[0]
     assert isinstance(exchange, FakeExchange)
     exchange._results["KXNFLGAME-26OCT05KCBUF"] = "yes"
     n_settled = asyncio.run(_check_settlements(ctx))
     assert n_settled == 1, f"Expected 1 settlement, got {n_settled}"
+    assert store.get_call_grade("call-1") is None, "settlement must not grade as a side effect"
+
+    # Grading is a separate per-loop step: it picks up the settled call now
+    # that a closing line exists.
+    n_graded = grade_pending_calls(ctx)
+    assert n_graded == 1, f"Expected 1 grade, got {n_graded}"
 
     # The persisted grade must tie CLV to the close, the REACTION fill price
     # (0.55, not the instant fill's 0.50), and the fee per contract
@@ -412,3 +428,155 @@ def test_full_cycle_settlement_and_grade():
     )
     # The call won (side yes, result yes): P&L per contract is (1 - price) - fee.
     assert grade["pnl_reaction"] == pytest.approx((1.0 - 0.55) - 0.01, abs=1e-9)
+
+
+def _record_settled_call(store, call_id, outcome, event, at):
+    """Record a call, its reaction fill, and a winning settlement."""
+    key = ListingKey(venue_id=KALSHI, market_id="KX-TEST", side="yes")
+    call = Call(
+        call_id=call_id,
+        created_at=at,
+        listing_key=key,
+        outcome=outcome,
+        fair_prob=0.58,
+        fair_se=0.02,
+        fair_method="power-devig",
+        limit_price_x=Decimal("0.60"),
+        contracts_n=10,
+        ask_at_alert=Decimal("0.57"),
+        net_edge_at_alert=Decimal("0.01"),
+        depth_at_x=100,
+        event_start=event.scheduled_start,
+    )
+    store.record_call(call)
+    store.record_paper_fill(
+        PaperFill(
+            call_id=call_id,
+            kind="reaction",
+            contracts=10,
+            avg_price=Decimal("0.55"),
+            fee=Decimal("0.10"),
+            filled=True,
+            at=at + timedelta(seconds=45),
+        )
+    )
+    store.record_settlement(
+        Settlement(
+            outcome_key=outcome_key(outcome),
+            result="win",
+            settled_at=event.scheduled_start + timedelta(hours=4),
+        )
+    )
+
+
+def test_grading_retries_after_transient_failure(monkeypatch):
+    """A transient grading error must not lose the call forever.
+
+    The old path graded as a side effect of settlement: one exception and
+    the call never came back. The per-loop step catches per call and picks
+    it up again on the next loop.
+    """
+    store = Store(":memory:")
+    event = _make_event("-retry")
+    outcome_yes = spread(event, KC, Decimal("-3.5"))
+    outcome_no = outcome_yes.complement()
+    assert outcome_no is not None
+    _record_half_point_quotes(store, event, outcome_yes, outcome_no)
+    listings = [
+        FakeListing(
+            ListingKey(venue_id=KALSHI, market_id="KX-R", side="yes"),
+            outcome_yes,
+            _make_terms(outcome_yes),
+        )
+    ]
+    ctx = _make_ctx(store, listings, event)
+    assert capture_closing_lines(ctx, event.scheduled_start + timedelta(minutes=30)) == 1
+    alert_at = event.scheduled_start - timedelta(hours=3)
+    _record_settled_call(store, "call-retry", outcome_yes, event, alert_at)
+
+    real_grade_call = calls_mod.grade_call
+    attempts = 0
+
+    def flaky(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("transient boom")
+        return real_grade_call(*args, **kwargs)
+
+    monkeypatch.setattr(calls_mod, "grade_call", flaky)
+
+    assert grade_pending_calls(ctx) == 0
+    assert store.get_call_grade_version("call-retry", CALL_GRADE_METHOD_VERSION) is None
+
+    # Next loop: the same call is picked up again and graded.
+    assert grade_pending_calls(ctx) == 1
+    grade = store.get_call_grade_version("call-retry", CALL_GRADE_METHOD_VERSION)
+    assert grade is not None
+    assert grade["clv_reaction"] is not None
+
+    # And grading is idempotent: a third loop writes nothing new.
+    assert grade_pending_calls(ctx) == 0
+    rows = store._conn.execute(
+        "SELECT COUNT(*) FROM call_grades WHERE call_id = 'call-retry'"
+    ).fetchone()[0]
+    assert rows == 1
+
+
+def test_grading_skips_call_without_close_then_grades_after_late_capture():
+    """A settled call with no closing line is left ungraded, not CLV-None.
+
+    The close may be captured late (no one-hour window); once it exists the
+    next grading loop picks the call up.
+    """
+    store = Store(":memory:")
+    event = _make_event("-noclose")
+    outcome_yes = spread(event, KC, Decimal("-3.5"))
+    outcome_no = outcome_yes.complement()
+    assert outcome_no is not None
+    listings = [
+        FakeListing(
+            ListingKey(venue_id=KALSHI, market_id="KX-N", side="yes"),
+            outcome_yes,
+            _make_terms(outcome_yes),
+        )
+    ]
+    ctx = _make_ctx(store, listings, event)
+    alert_at = event.scheduled_start - timedelta(hours=3)
+    _record_settled_call(store, "call-noclose", outcome_yes, event, alert_at)
+
+    # No quotes recorded: no close can be captured, so no grade.
+    assert grade_pending_calls(ctx) == 0
+    assert store.get_call_grade_version("call-noclose", CALL_GRADE_METHOD_VERSION) is None
+
+    # Quotes arrive late (after a restart, say). Capture has no one-hour
+    # window: three hours after kickoff it still computes the same close
+    # from stored pre-kickoff history.
+    _record_half_point_quotes(store, event, outcome_yes, outcome_no)
+    n = capture_closing_lines(ctx, event.scheduled_start + timedelta(hours=3))
+    assert n == 1
+
+    assert grade_pending_calls(ctx) == 1
+    grade = store.get_call_grade_version("call-noclose", CALL_GRADE_METHOD_VERSION)
+    assert grade is not None
+    assert grade["clv_reaction"] is not None
+
+
+def test_capture_skips_events_that_have_not_started():
+    """Closing lines are pre-game consensus: future events are not captured."""
+    store = Store(":memory:")
+    event = _make_event("-future")
+    outcome_yes = spread(event, KC, Decimal("-3.5"))
+    outcome_no = outcome_yes.complement()
+    assert outcome_no is not None
+    _record_half_point_quotes(store, event, outcome_yes, outcome_no)
+    listings = [
+        FakeListing(
+            ListingKey(venue_id=KALSHI, market_id="KX-F", side="yes"),
+            outcome_yes,
+            _make_terms(outcome_yes),
+        )
+    ]
+    ctx = _make_ctx(store, listings, event)
+    assert capture_closing_lines(ctx, event.scheduled_start - timedelta(hours=1)) == 0
+    assert store.get_closing_line(outcome_key(outcome_yes)) is None

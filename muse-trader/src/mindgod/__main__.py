@@ -58,7 +58,12 @@ def build_context(
     polymarket = PolymarketExchange(token_ids)
 
     odds_key = os.environ.get("ODDS_API_KEY", "")
-    sportsbook = OddsApiSource(api_key=odds_key) if odds_key else None
+    # ODDS_API_MARKETS controls credit burn: the API charges per market per
+    # poll (h2h-only costs 1 credit vs 3 for h2h,spreads,totals). Moneyline
+    # listings only ever look up h2h outcomes, so a moneyline-only deployment
+    # can safely run h2h-only.
+    odds_markets = os.environ.get("ODDS_API_MARKETS", "h2h,spreads,totals")
+    sportsbook = OddsApiSource(api_key=odds_key, markets=odds_markets) if odds_key else None
     if sportsbook is None:
         log.warning("ODDS_API_KEY not set: running without sportsbook prices")
 

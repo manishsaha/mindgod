@@ -5,7 +5,12 @@
 
 polling:
   exchange_interval_s: 60
-  sportsbook_interval_s: 300
+  # 600s: the Odds API charges 1 credit per market per poll, so h2h-only at
+  # 10 min costs 6 credits/hour. Fri 11pm -> Mon midnight is ~73h = ~438
+  # credits, inside a 500/month quota with headroom. 300s would burn 876.
+  # Run ODDS_API_MARKETS=h2h (see .env.example); the default
+  # h2h,spreads,totals costs 3 credits/poll.
+  sportsbook_interval_s: 600
   discovery_interval_s: 3600
 
 pricing:

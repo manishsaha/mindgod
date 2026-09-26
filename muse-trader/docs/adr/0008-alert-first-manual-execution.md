@@ -107,6 +107,17 @@ model below). The headline metric is closing line value (CLV) against the
 sharp close, for reaction fills and manual fills. Profit and loss is
 reported, but it is noise over short samples and never drives decisions.
 
+Settlement and grading are separate steps. Settlement records the fact, once
+per outcome. Grading is a retryable step that runs every loop over calls
+that have a settlement, have no grade at the current method version, and
+have a closing line at the current version. A transient grading error is
+retried on the next loop instead of losing the call forever; a settled call
+with no closing line is left ungraded (not graded with CLV None) and shows
+up in the exclusion breakdown as "no close". Closing-line capture has no
+one-hour window: it fills in any started event missing a close at the
+current version, reading stored history as of kickoff, so late capture
+after a restart computes the same value.
+
 ## Data model
 
 All tables are append-only. IDs are opaque strings.
@@ -117,9 +128,9 @@ All tables are append-only. IDs are opaque strings.
 | `call_snapshots` | call_id, offset_s (0/30/120/600), best_ask, best_bid, depth_at_x, recorded_at | Scheduled after the alert |
 | `paper_fills` | call_id, kind (`reaction` \| `instant`), contracts, avg_price, fee, filled (bool) | At +0 and +`reaction_delay_s` |
 | `manual_fills` | call_id, contracts, price, fee, taken_at, note | User taps "Took it" |
-| `closing_lines` | outcome_key, sharp_close_prob, source, captured_at | At event start (last sharp consensus before lock) |
-| `settlements` | outcome_key, result (win/loss/refund/void), settled_at | Settlement feed |
-| `call_grades` | call_id, clv_reaction, clv_manual, pnl_reaction, pnl_manual, edge_half_life_s | After close, updated after settlement |
+| `closing_lines` | outcome_key, sharp_close_prob, source, captured_at | Any started event missing a close at the current version (no one-hour window; late capture is safe) |
+| `settlements` | outcome_key, result (win/loss/refund/void), settled_at | Settlement feed (records the fact only; never grades) |
+| `call_grades` | call_id, clv_reaction, clv_manual, pnl_reaction, pnl_manual, edge_half_life_s | Per-loop grading step: settled + ungraded at current version + close exists |
 
 Definitions:
 - `clv = sharp_close_prob - fill_avg_price - fee_per_contract` (per contract,

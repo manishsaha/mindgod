@@ -41,7 +41,13 @@ send() { # $1 = message text
 }
 
 container_running() {
-  docker compose -f "$DIR/docker-compose.yml" ps -q mindgod 2>/dev/null | grep -q .
+  # Docker path (compose deployment).
+  if command -v docker >/dev/null 2>&1 \
+    && docker compose -f "$DIR/docker-compose.yml" ps -q mindgod 2>/dev/null | grep -q .; then
+    return 0
+  fi
+  # Bare-process path (service launched directly, no container).
+  pgrep -f "[p]ython -m mindgod" >/dev/null 2>&1
 }
 
 db_age_min() {
@@ -81,7 +87,7 @@ HB_SENT="$STATE_DIR/last_heartbeat"
 # 1. Container check.
 if ! container_running; then
   if [ ! -f "$DOWN_FLAG" ]; then
-    send "🚨 MindGod shadow: container is DOWN (watchdog $(date -u +%H:%M UTC))."
+    send "🚨 MindGod shadow: service is DOWN (watchdog $(date -u +%H:%M UTC))."
     touch "$DOWN_FLAG"
   fi
   exit 0

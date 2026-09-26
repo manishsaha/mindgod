@@ -6,6 +6,7 @@ not code. They change over time and differ across markets.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, cast
@@ -124,6 +125,29 @@ def _build[T](cls: type[T], data: Any) -> T:
     return cls(**{k: v for k, v in data.items() if k in known})
 
 
+class _Loader(yaml.SafeLoader):
+    """YAML loader with 1.2 core-schema booleans.
+
+    yaml.SafeLoader implements YAML 1.1, where unquoted yes/no/on/off become
+    booleans. That corrupts config strings: `side: yes` becomes True and the
+    Saints' team code `home: NO` becomes False, crashing listing setup. YAML
+    1.2 only treats true/false as booleans, so every other scalar stays a
+    string. Real bool fields (e.g. refunds_on_tie) keep working as long as
+    they are written true/false.
+    """
+
+
+_Loader.yaml_implicit_resolvers = {
+    first: [(tag, regexp) for tag, regexp in mappings if tag != "tag:yaml.org,2002:bool"]
+    for first, mappings in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+_Loader.add_implicit_resolver(
+    "tag:yaml.org,2002:bool",
+    re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"),
+    list("tTfF"),
+)
+
+
 def load_settings(path: str | Path | None = None) -> Settings:
     if path is None:
         for candidate in ("config.yaml", "config.example.yaml"):
@@ -133,7 +157,7 @@ def load_settings(path: str | Path | None = None) -> Settings:
     if path is None:
         return Settings()
     with open(path, encoding="utf-8") as fh:
-        data = yaml.safe_load(fh) or {}
+        data = yaml.load(fh, Loader=_Loader) or {}
     return Settings(
         polling=_build(PollingConfig, data.get("polling")),
         pricing=_build(PricingConfig, data.get("pricing")),

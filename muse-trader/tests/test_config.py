@@ -60,3 +60,46 @@ def test_week4_deploy_config_loads_all_listings() -> None:
     ids = [spec.market_id for spec in settings.listings]
     assert len(set(ids)) == 15
     assert "KXNFLGAME-26SEP28PHICHI-CHI" in ids
+    # Unquoted `yes` in YAML is a boolean; it must normalize to the string.
+    assert all(spec.side in ("yes", "no") for spec in settings.listings)
+
+
+def test_unquoted_yaml_yes_no_and_team_codes_stay_strings(tmp_path: Path) -> None:
+    # YAML 1.1 would parse `yes`/`no` as booleans and the Saints' team code
+    # `NO` as False; the loader must keep them as strings.
+    path = _write(
+        tmp_path,
+        """\
+listings:
+  - venue: kalshi
+    market_id: YES1
+    side: yes
+    home: BUF
+    away: LAC
+  - venue: kalshi
+    market_id: NO1
+    side: no
+    home: NO
+    away: BUF
+""",
+    )
+    settings = load_settings(path)
+    assert [spec.side for spec in settings.listings] == ["yes", "no"]
+    assert settings.listings[1].home == "NO"
+
+
+def test_yaml_true_false_still_parse_as_bools(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        """\
+listings:
+  - venue: kalshi
+    market_id: B1
+    refunds_on_tie: true
+  - venue: kalshi
+    market_id: B2
+    refunds_on_tie: false
+""",
+    )
+    settings = load_settings(path)
+    assert [spec.refunds_on_tie for spec in settings.listings] == [True, False]

@@ -178,6 +178,22 @@ class Store(ObservationStore):
                 self._conn.execute(
                     f"ALTER TABLE {table} ADD COLUMN method_version INTEGER NOT NULL DEFAULT 1"
                 )
+        # The unique index is a backstop, not a migration: if an older
+        # database already has duplicate (call_id, method_version) rows,
+        # creating it would fail with a bare IntegrityError and the service
+        # would not start. Fail first with a message that says what to do.
+        dups = self._conn.execute(
+            "SELECT call_id, method_version, COUNT(*) FROM call_grades"
+            " GROUP BY call_id, method_version HAVING COUNT(*) > 1 LIMIT 5"
+        ).fetchall()
+        if dups:
+            detail = ", ".join(f"{c} v{v} x{n}" for c, v, n in dups)
+            raise RuntimeError(
+                "call_grades already has duplicate (call_id, method_version) rows"
+                f" ({detail}): the unique backstop index cannot be created."
+                " Dedupe the table, keeping the latest row per call and version,"
+                " before starting the service."
+            )
         self._conn.execute(
             """CREATE UNIQUE INDEX IF NOT EXISTS call_grades_call_version_ux
                ON call_grades(call_id, method_version)"""

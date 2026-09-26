@@ -139,22 +139,22 @@ def test_excluded_clv_breakdown(tmp_path):
     recompute_closes_and_grades(store, _model(), dry_run=False, now=NOW)
 
     excluded = excluded_clv_breakdown(path, _model())
-    assert excluded == {"stale": 1, "no_settlement": 1}
+    assert excluded == {"no close": 1, "no_settlement": 1}
 
     text = format_report(report_by_price_bucket(path), excluded)
     assert "NO CLV AT v2" in text
-    assert "stale" in text and "no_settlement" in text
+    assert "no close" in text and "no_settlement" in text
 
 
 def test_excluded_breakdown_before_apply(tmp_path):
     path = str(tmp_path / "r.db")
     _seed_report_db(path)
     # Recompute not applied yet: call-ok would get a full v2 grade,
-    # call-stale is stale regardless, call-open never settled.
+    # call-stale is settled with no usable close, call-open never settled.
     excluded = excluded_clv_breakdown(path, _model())
     assert excluded == {
         "awaiting_recompute": 1,
-        "stale": 1,
+        "no close": 1,
         "no_settlement": 1,
     }
 
@@ -225,3 +225,33 @@ def test_unique_index_added_to_legacy_db(tmp_path):
 
     with pytest.raises(sqlite3.IntegrityError):
         store.record_call_grade(grade())
+
+
+def test_duplicate_grades_fail_startup_with_clear_message(tmp_path):
+    """An older DB that already has duplicate grades must fail loudly.
+
+    The unique index is a backstop, not a migration: creating it over
+    duplicates would raise a bare IntegrityError and the service would not
+    start. The pre-check raises a RuntimeError that says what to do.
+    """
+    path = str(tmp_path / "dup.db")
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """CREATE TABLE call_grades(
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             call_id TEXT NOT NULL,
+             clv_reaction REAL, clv_manual REAL, pnl_reaction REAL,
+             pnl_manual REAL, edge_half_life_s REAL,
+             graded_at TEXT NOT NULL,
+             method_version INTEGER NOT NULL DEFAULT 1)"""
+    )
+    for ts in ("2026-09-26T00:00:00+00:00", "2026-09-26T01:00:00+00:00"):
+        conn.execute(
+            "INSERT INTO call_grades (call_id, graded_at, method_version) VALUES ('c1', ?, 2)",
+            (ts,),
+        )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(RuntimeError, match="call_grades already has duplicate"):
+        Store(path)

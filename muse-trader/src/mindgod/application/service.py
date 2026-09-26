@@ -667,7 +667,11 @@ def capture_closing_lines(
     Each side is looked up under its own key, so there's nothing to flip:
     Yes and No listings get their own devigged probabilities directly.
 
-    Called periodically; captures for events that started since the last call.
+    Called every loop; captures for any started event that has no closing
+    line at the current method version. There is deliberately no one-hour
+    window: the close reads stored history as of kickoff, so a late capture
+    (e.g. after a restart during the first hour) computes the same value,
+    and a failed capture is retried on later loops.
     Returns the number of closing lines captured.
     """
     from .calls import ClosingLine
@@ -679,9 +683,10 @@ def capture_closing_lines(
             start = ctx.resolver.event_start(listing.key)
             if start is None:
                 continue
-            # Capture if the event started within the last hour and we haven't
-            # captured it yet.
-            if not (timedelta(0) <= at - start < timedelta(hours=1)):
+            # Capture for any event that has started and has no close at the
+            # current version. No one-hour window: late capture reads the
+            # same stored pre-kickoff history, so it computes the same close.
+            if at < start:
                 continue
 
             # Check if already captured (version-aware: only the current
@@ -725,6 +730,10 @@ async def _check_settlements(ctx: ServiceContext) -> int:
     """ADR-0008: fetch market results from Kalshi and record settlements.
 
     For each unsettled call, get the market result and determine win/loss.
+    Settlement only records the fact, once per outcome. Grading is a
+    separate per-loop step (grade_pending_calls): grading here used to be a
+    side effect of settlement, so a transient grading error left the call
+    ungraded forever.
     Returns the number of settlements recorded.
     """
     unsettled = ctx.store.unsettled_calls()
@@ -776,14 +785,61 @@ async def _check_settlements(ctx: ServiceContext) -> int:
                 )
                 ctx.store.record_settlement(settlement)
                 n += 1
-                # Grade the call now that we have settlement
-                try:
-                    _grade_settled_call(ctx.store, call_id, outcome_key, settlement, now)
-                except Exception:
-                    log.exception("grading failed for %s", call_id)
             except Exception:
                 log.exception("record_settlement failed for %s", call_id)
 
+    return n
+
+
+def grade_pending_calls(ctx: ServiceContext) -> int:
+    """ADR-0008: grade settled calls as a separate, retryable per-loop step.
+
+    Runs every loop over calls that have a settlement, have no grade at
+    CALL_GRADE_METHOD_VERSION, and have a closing line at
+    CLOSING_LINE_METHOD_VERSION. It only picks up ungraded calls, so
+    re-running is always safe; the unique index on (call_id, method_version)
+    stays as a backstop behind it.
+
+    A transient grading error is caught per call and retried on the next
+    loop instead of losing the call forever. A settled call with no closing
+    line is skipped (not graded with CLV None): the close may be captured
+    late, and until then the call shows up in the exclusion breakdown as
+    "no close" rather than silently dropping out of the CLV numbers.
+
+    Returns the number of grades written.
+    """
+    from .calls import (
+        CALL_GRADE_METHOD_VERSION,
+        CLOSING_LINE_METHOD_VERSION,
+        Settlement,
+    )
+
+    now = datetime.now(UTC)
+    n = 0
+    for s in ctx.store.settled_calls():
+        call_id = s["call_id"]
+        if ctx.store.get_call_grade_version(call_id, CALL_GRADE_METHOD_VERSION) is not None:
+            continue
+        canonical = ctx.store.canonical_outcome_key(s["outcome"])
+        if ctx.store.get_closing_line_version(canonical, CLOSING_LINE_METHOD_VERSION) is None:
+            continue
+        try:
+            settlement = Settlement(
+                outcome_key=canonical,
+                result=s["result"],
+                settled_at=datetime.fromisoformat(s["settled_at"]),
+            )
+            _grade_settled_call(
+                ctx.store,
+                call_id,
+                canonical,
+                settlement,
+                now,
+                close_version=CLOSING_LINE_METHOD_VERSION,
+            )
+            n += 1
+        except Exception:
+            log.exception("grading failed for %s; will retry next loop", call_id)
     return n
 
 
@@ -993,6 +1049,15 @@ async def run_forever(
                     log.info("recorded %d settlements", n_settled)
             except Exception:
                 log.exception("settlement check failed")
+            # ADR-0008: grade settled calls as a separate retryable step.
+            # Only picks up calls with a settlement, no current-version
+            # grade, and a closing line; safe to run every loop.
+            try:
+                n_graded = grade_pending_calls(ctx)
+                if n_graded:
+                    log.info("graded %d settled calls", n_graded)
+            except Exception:
+                log.exception("grading step failed")
             log.info("tick done: %d opportunities", len(opps))
         except Exception:
             log.exception("tick failed")

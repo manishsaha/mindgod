@@ -111,11 +111,13 @@ def report_summary(db_path: str) -> GradeSlice:
 def excluded_clv_breakdown(db_path: str, model: FairValueModel) -> dict[str, int]:
     """Calls with no CLV at the current method version, by reason.
 
-    The same breakdown the recompute dry run prints: `no_settlement`,
-    or the close failure reason (`no_complement`, `no_quotes`, `no_pair`,
-    `stale`, `devig_failed`, `no_consensus`). Covers both calls excluded
-    from the report entirely (no current-version grade row) and calls
-    present P&L-only (current-version row with NULL clv_reaction).
+    The same breakdown the recompute dry run prints: `no_settlement`, or
+    `no close` for settled calls with no closing line at the current
+    version (the live loop leaves these ungraded instead of writing a
+    CLV-None grade, so they must be visible here rather than silently
+    dropping out of the averages). Covers both calls excluded from the
+    report entirely (no current-version grade row) and calls present
+    P&L-only (current-version row with NULL clv_reaction).
 
     The reasons come from the recompute's own dry-run classification, so
     they cannot drift from what the migration reports. `model` is the
@@ -136,7 +138,11 @@ def excluded_clv_breakdown(db_path: str, model: FairValueModel) -> dict[str, int
         if not r.settled:
             reason = "no_settlement"
         elif r.close_status.startswith("failed:"):
-            reason = r.close_status[len("failed:") :]
+            # Settled but no closing line: the live grading step skips these
+            # instead of writing a CLV-None grade. Report the user-facing
+            # fact ("no close"); the recompute's per-call report keeps the
+            # specific failure reason for diagnostics.
+            reason = "no close"
         else:
             # Settled and the close would compute: the recompute has not
             # been applied (or re-applied) for this call yet.
