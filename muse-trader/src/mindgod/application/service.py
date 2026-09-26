@@ -32,7 +32,6 @@ from mindgod.domain.venues import Listing, ListingKey, VenueId
 
 from .calls import (
     Call,
-    CallGrade,
     Settlement,
     build_call,
     instant_fill,
@@ -559,6 +558,13 @@ def capture_closing_lines(
     Queries the quote log for the last consensus with valid_at before the
     event start, not live data after it. This avoids capturing in-game prices.
 
+    Note: The current implementation averages raw implied probabilities which
+    include vig. A full fix should rebuild priced outcomes from the store and
+    run them through values_by_terms (devig, sharp weights, terms partitioning,
+    lone-side drop). That requires storing the full Outcome/Terms in the quote
+    log, which is not yet done. For now, we at least handle the No-side
+    correctly (single complement, not double).
+
     Called periodically; captures for events that started since the last call.
     Returns the number of closing lines captured.
     """
@@ -572,7 +578,7 @@ def capture_closing_lines(
             if start is None:
                 continue
             # Capture if the event started within the last hour and we haven't
-            # captured it yet. Check by seeing if a closing line exists.
+            # captured it yet.
             if not (timedelta(0) <= at - start < timedelta(hours=1)):
                 continue
 
@@ -586,15 +592,17 @@ def capture_closing_lines(
             if not quotes:
                 continue
 
-            # Simple consensus: average of latest prices per venue
-            # (A full devig would be better, but this is a reasonable approximation
-            # for the closing line)
+            # Simple consensus: average of latest prices per venue.
+            # TODO: Replace with full devig pipeline (values_by_terms) once
+            # the quote log stores enough to rebuild PricedOutcome.
             prices = [price for _, price, _ in quotes]
             if not prices:
                 continue
             prob = sum(prices) / len(prices)
 
-            # Adjust for side
+            # For No listings, the stored quotes are Yes probabilities (the book
+            # prices the Yes side). Flip exactly once to get the No probability.
+            # The bug was flipping twice: once when storing, once here.
             if listing.key.side == "no":
                 prob = 1.0 - prob
 
@@ -660,8 +668,12 @@ async def _check_settlements(ctx: ServiceContext) -> int:
         if result is None:
             continue  # Not settled yet
         for call_id, side, outcome_key in by_market[ticker]:
-            # Determine win/loss: if market result matches the side we bet
-            if (result == "yes" and side == "yes") or (result == "no" and side == "no"):
+            # Handle voided/cancelled markets: record as "void" so the call
+            # doesn't get re-polled forever. Any result other than yes/no
+            # is treated as void.
+            if result not in ("yes", "no"):
+                outcome = "void"
+            elif (result == "yes" and side == "yes") or (result == "no" and side == "no"):
                 outcome = "win"
             else:
                 outcome = "loss"
@@ -691,46 +703,108 @@ def _grade_settled_call(
     settlement: Settlement,
     at: datetime,
 ) -> None:
-    """Grade a call that just settled.
+    """Grade a call that just settled using the tested grade_call().
 
-    Computes simplified CLV and P&L from the stored fill and closing line.
-    Full grade_call reconstruction is deferred; this records the essential
-    metrics so the evaluation loop runs.
+    Reconstructs PaperFill, ManualFill, CallSnapshot, and ClosingLine from
+    the store, then calls grade_call() which handles fees, per-contract
+    units, no-fill results, and edge half-life.
     """
-    # Get the reaction fill (latest paper fill)
-    fill_data = ctx.store.get_paper_fill(call_id)
-    if not fill_data:
-        return
+    from decimal import Decimal
+    from typing import cast
 
-    fill_price = fill_data["price"]  # avg_price
-    contracts = fill_data["contracts"]
-    if fill_price is None or contracts == 0:
-        return
+    from mindgod.domain.propositions import Outcome
+    from mindgod.domain.venues import ListingKey
 
-    # Get closing line for CLV
-    cl_data = ctx.store.get_closing_line(outcome_key)
-    clv_reaction = None
-    if cl_data:
-        # CLV = sharp_close - fill_price (per contract, ignoring fees for now)
-        clv_reaction = cl_data["sharp_close_prob"] - fill_price
-
-    # P&L from settlement: win = 1.0, loss = 0.0, minus fill price
-    pnl_reaction = None
-    if settlement.result == "win":
-        pnl_reaction = (1.0 - fill_price) * contracts
-    elif settlement.result == "loss":
-        pnl_reaction = (0.0 - fill_price) * contracts
-    # refund/void: pnl = 0
-
-    grade = CallGrade(
-        call_id=call_id,
-        clv_reaction=clv_reaction,
-        clv_manual=None,  # Manual fills graded separately
-        pnl_reaction=pnl_reaction,
-        pnl_manual=None,
-        edge_half_life_s=None,  # Requires snapshots, deferred
-        graded_at=at,
+    from .calls import (
+        Call,
+        CallSnapshot,
+        ClosingLine,
+        ManualFill,
+        PaperFill,
+        grade_call,
     )
+
+    # Fetch call data (for ask_at_alert, limit_price_x, etc.)
+    call_data = ctx.store.get_call(call_id)
+    if not call_data:
+        return
+
+    # Construct minimal Call: grade_call only uses call_id, ask_at_alert,
+    # limit_price_x. The listing_key and outcome are not used in grading.
+    call = Call(
+        call_id=call_data["call_id"],
+        created_at=datetime.fromisoformat(call_data["created_at"]),
+        listing_key=cast(ListingKey, None),
+        outcome=cast(Outcome, None),
+        fair_prob=call_data["fair_prob"],
+        fair_se=call_data["fair_se"],
+        fair_method=call_data["fair_method"],
+        limit_price_x=Decimal(str(call_data["limit_price_x"])),
+        contracts_n=call_data["contracts_n"],
+        ask_at_alert=Decimal(str(call_data["ask_at_alert"])),
+        net_edge_at_alert=Decimal(str(call_data["net_edge_at_alert"])),
+        depth_at_x=call_data["depth_at_x"],
+        event_start=datetime.fromisoformat(call_data["event_start"])
+        if call_data["event_start"]
+        else None,
+    )
+
+    # Fetch reaction fill (kind='reaction' specifically, per ADR-0008)
+    reaction_fill = None
+    fill_data = ctx.store.get_paper_fill(call_id)
+    if fill_data:
+        # ADR-0008: a "no fill" is itself a result; grade_call handles filled=False
+        reaction_fill = PaperFill(
+            call_id=fill_data["call_id"],
+            kind=fill_data["kind"],
+            contracts=fill_data["contracts"],
+            avg_price=Decimal(str(fill_data["avg_price"]))
+            if fill_data["avg_price"] is not None
+            else None,
+            fee=Decimal(str(fill_data["fee"])) if fill_data["fee"] is not None else None,
+            filled=fill_data["filled"],
+            at=datetime.fromisoformat(fill_data["at"]),
+        )
+
+    # Fetch manual fill (if any)
+    manual_fill = None
+    m_data = ctx.store.get_manual_fill(call_id)
+    if m_data:
+        manual_fill = ManualFill(
+            call_id=m_data["call_id"],
+            contracts=m_data["contracts"],
+            price=Decimal(str(m_data["price"])),
+            fee=Decimal(str(m_data["fee"])),
+            taken_at=datetime.fromisoformat(m_data["taken_at"]),
+            note=m_data["note"],
+        )
+
+    # Fetch snapshots
+    snapshots = []
+    for r in ctx.store.get_snapshots(call_id):
+        snapshots.append(
+            CallSnapshot(
+                call_id=r["call_id"],
+                offset_s=r["offset_s"],
+                best_ask=Decimal(str(r["best_ask"])) if r["best_ask"] is not None else None,
+                best_bid=Decimal(str(r["best_bid"])) if r["best_bid"] is not None else None,
+                depth_at_x=r["depth_at_x"],
+                recorded_at=datetime.fromisoformat(r["recorded_at"]),
+            )
+        )
+
+    # Fetch closing line
+    closing_line = None
+    cl_data = ctx.store.get_closing_line(outcome_key)
+    if cl_data:
+        closing_line = ClosingLine(
+            outcome_key=cl_data["outcome_key"],
+            sharp_close_prob=cl_data["sharp_close_prob"],
+            source=cl_data["source"],
+            captured_at=datetime.fromisoformat(cl_data["captured_at"]),
+        )
+
+    grade = grade_call(call, reaction_fill, manual_fill, snapshots, closing_line, settlement, at)
     ctx.store.record_call_grade(grade)
 
 
@@ -751,29 +825,34 @@ async def run_forever(
                     priced = await ctx.sportsbook.priced_outcomes()
                     ctx.sportsbook_refreshed = True
                     last_sportsbook = now_ts
-                    # ADR-0009: clear pitcher suppression only when the refreshed
-                    # quote for that event has valid_at later than the change time,
-                    # or after a 10-minute cool-off, whichever is later. This
-                    # prevents lifting suppression before books have repriced.
+                    # ADR-0009: clear pitcher suppression only when BOTH conditions hold:
+                    # the refreshed moneyline quote for that event has valid_at
+                    # later than the change time, AND the 10-minute cool-off has
+                    # elapsed. "Whichever is later" means both must be satisfied.
+                    # This prevents lifting suppression before books have repriced.
                     if ctx.pitcher_suppressed:
                         now = datetime.now(UTC)
                         to_clear = []
                         for eid, change_time in ctx.pitcher_suppressed.items():
                             # Check cool-off: 10 minutes since change
                             cool_off_done = (now - change_time) >= timedelta(minutes=10)
-                            # Check if any priced outcome for this event has
-                            # valid_at after the change time
+                            # Check if the moneyline for this event has been repriced
+                            # after the change time. Only moneyline quotes count;
+                            # a nudge to the total must not clear moneyline suppression.
+                            # We check the event_id; a more precise check would verify
+                            # the market type, but the Quantity doesn't expose it directly.
                             repriced = False
                             for p in priced:
                                 try:
                                     pid = str(p.outcome.quantity.event_id)
                                 except AttributeError:
                                     continue
-                                # valid_at is when the book last updated
                                 if pid == eid and p.quote.observed.valid_at > change_time:
+                                    # valid_at is when the book last updated
                                     repriced = True
                                     break
-                            if repriced or cool_off_done:
+                            # Both conditions must hold (AND, not OR)
+                            if repriced and cool_off_done:
                                 to_clear.append(eid)
                         for eid in to_clear:
                             del ctx.pitcher_suppressed[eid]

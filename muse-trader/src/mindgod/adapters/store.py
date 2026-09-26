@@ -400,11 +400,14 @@ class Store(ObservationStore):
         self._conn.commit()
 
     def unsettled_calls(self) -> list[tuple[str, str, str, str]]:
-        """Get calls that need settlement: (call_id, market_id, side, outcome_key)."""
+        """Get calls that need settlement: (call_id, market_id, side, outcome_key).
+
+        Note: calls.outcome stores the outcome_key value.
+        """
         rows = self._conn.execute(
-            """SELECT c.call_id, c.market_id, c.side, c.outcome_key
+            """SELECT c.call_id, c.market_id, c.side, c.outcome
                FROM calls c
-               LEFT JOIN settlements s ON c.outcome_key = s.outcome_key
+               LEFT JOIN settlements s ON c.outcome = s.outcome_key
                WHERE s.outcome_key IS NULL""",
         ).fetchall()
         return [(r[0], r[1], r[2], r[3]) for r in rows]
@@ -414,7 +417,7 @@ class Store(ObservationStore):
         row = self._conn.execute(
             "SELECT call_id, created_at, venue, market_id, side, outcome, fair_prob,"
             " fair_se, fair_method, limit_price_x, contracts_n, ask_at_alert,"
-            " outcome_key FROM calls WHERE call_id = ?",
+            " net_edge_at_alert, depth_at_x, event_start FROM calls WHERE call_id = ?",
             (call_id,),
         ).fetchone()
         if not row:
@@ -425,50 +428,60 @@ class Store(ObservationStore):
             "venue": row[2],
             "market_id": row[3],
             "side": row[4],
-            "outcome": row[5],
+            "outcome_key": row[5],  # calls.outcome stores outcome_key
             "fair_prob": row[6],
             "fair_se": row[7],
             "fair_method": row[8],
             "limit_price_x": row[9],
             "contracts_n": row[10],
             "ask_at_alert": row[11],
-            "outcome_key": row[12],
+            "net_edge_at_alert": row[12],
+            "depth_at_x": row[13],
+            "event_start": row[14],
         }
 
     def get_paper_fill(self, call_id: str) -> dict[str, Any] | None:
-        """Fetch the latest paper fill for a call."""
+        """Fetch the reaction paper fill for a call.
+
+        ADR-0008: must query kind='reaction' specifically. The instant fill
+        must never feed headline metrics.
+        """
         row = self._conn.execute(
-            "SELECT fill_id, call_id, filled_at, price, contracts, kind"
-            " FROM paper_fills WHERE call_id = ? ORDER BY filled_at DESC LIMIT 1",
+            "SELECT id, call_id, kind, contracts, avg_price, fee, filled, at"
+            " FROM paper_fills WHERE call_id = ? AND kind = 'reaction'"
+            " ORDER BY at DESC LIMIT 1",
             (call_id,),
         ).fetchone()
         if not row:
             return None
         return {
-            "fill_id": row[0],
+            "id": row[0],
             "call_id": row[1],
-            "filled_at": row[2],
-            "price": row[3],
-            "contracts": row[4],
-            "kind": row[5],
+            "kind": row[2],
+            "contracts": row[3],
+            "avg_price": row[4],
+            "fee": row[5],
+            "filled": bool(row[6]),
+            "at": row[7],
         }
 
     def get_manual_fill(self, call_id: str) -> dict[str, Any] | None:
         """Fetch the manual fill for a call, if any."""
         row = self._conn.execute(
-            "SELECT fill_id, call_id, filled_at, price, contracts, noted_at"
+            "SELECT id, call_id, contracts, price, fee, taken_at, note"
             " FROM manual_fills WHERE call_id = ? LIMIT 1",
             (call_id,),
         ).fetchone()
         if not row:
             return None
         return {
-            "fill_id": row[0],
+            "id": row[0],
             "call_id": row[1],
-            "filled_at": row[2],
+            "contracts": row[2],
             "price": row[3],
-            "contracts": row[4],
-            "noted_at": row[5],
+            "fee": row[4],
+            "taken_at": row[5],
+            "note": row[6],
         }
 
     def get_snapshots(self, call_id: str) -> list[dict[str, Any]]:
