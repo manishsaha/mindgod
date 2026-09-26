@@ -133,7 +133,8 @@ class Store(ObservationStore):
                  outcome_key TEXT NOT NULL,
                  sharp_close_prob REAL NOT NULL,
                  source TEXT NOT NULL,
-                 captured_at TEXT NOT NULL)"""
+                 captured_at TEXT NOT NULL,
+                 method_version INTEGER NOT NULL DEFAULT 1)"""
         )
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS settlements(
@@ -151,7 +152,9 @@ class Store(ObservationStore):
                  pnl_reaction REAL,
                  pnl_manual REAL,
                  edge_half_life_s REAL,
-                 graded_at TEXT NOT NULL)"""
+                 graded_at TEXT NOT NULL,
+                 method_version INTEGER NOT NULL DEFAULT 1,
+                 UNIQUE(call_id, method_version))"""
         )
         self._ensure_method_versioning()
         self._conn.commit()
@@ -163,6 +166,11 @@ class Store(ObservationStore):
         column default; new writes stamp the current version. Old rows are
         never backfilled, overwritten, or deleted: the recompute migration
         appends new-version rows and readers take the latest version.
+
+        One row per (call_id, method_version): the unique index is a
+        backstop so a second grading pass can't write a duplicate row
+        that report joins would count twice. Duplicates raise
+        sqlite3.IntegrityError instead of silently doubling.
         """
         for table in ("closing_lines", "call_grades"):
             cols = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -170,6 +178,10 @@ class Store(ObservationStore):
                 self._conn.execute(
                     f"ALTER TABLE {table} ADD COLUMN method_version INTEGER NOT NULL DEFAULT 1"
                 )
+        self._conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS call_grades_call_version_ux
+               ON call_grades(call_id, method_version)"""
+        )
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS outcome_key_remap(
                  old_key TEXT PRIMARY KEY,
@@ -415,7 +427,13 @@ class Store(ObservationStore):
         self._conn.commit()
 
     def record_call_grade(self, grade: CallGrade) -> None:
-        """ADR-0008: CLV/P&L/half-life for a call, after close and settlement."""
+        """ADR-0008: CLV/P&L/half-life for a call, after close and settlement.
+
+        One row per (call_id, method_version): writing a second grade for
+        the same call at the same version raises sqlite3.IntegrityError.
+        Callers that may re-run (settlement re-polls, the recompute) must
+        check for an existing row first.
+        """
         self._conn.execute(
             "INSERT INTO call_grades (call_id, clv_reaction, clv_manual,"
             " pnl_reaction, pnl_manual, edge_half_life_s, graded_at,"

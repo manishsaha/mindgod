@@ -30,6 +30,17 @@ table so legacy calls join to their recomputed closes. The recompute CLI
 (`mindgod.application.recompute`) runs dry-run by default and exits nonzero
 in apply mode if the vig-removal sanity check fails.
 
+Report versioning fix (2026-09-26, in review): reports read only the
+current grade method version (`CALL_GRADE_METHOD_VERSION`), never
+MAX(method_version) per call. A call the recompute cannot regrade (no
+settlement, stale quotes, no complement pair) keeps its v1 row but is
+excluded from the averages, so the vig-biased v1 grades cannot leak back
+in. `reports.excluded_clv_breakdown()` reports how many calls have no CLV
+at the current version and why, using the recompute's own dry-run
+classification. `call_grades` carries a unique constraint on
+(call_id, method_version) so a second grading pass raises instead of
+writing a duplicate row that report joins would count twice.
+
 ## Context
 
 The current goal is to call out sharp bets, not to automate execution. The
