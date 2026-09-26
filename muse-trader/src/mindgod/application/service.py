@@ -555,23 +555,34 @@ def capture_closing_lines(
 ) -> int:
     """ADR-0008: record the last sharp consensus before events lock.
 
-    Queries the quote log for the last consensus with valid_at before the
-    event start, not live data after it. This avoids capturing in-game prices.
+    For each listing, pairs the outcome with its exact complement per venue,
+    devigs each pair (removing the vig), and takes a sharp-weighted average.
+    This produces a true fair-value closing line, not a vig-included average.
 
-    Note: The current implementation averages raw implied probabilities which
-    include vig. A full fix should rebuild priced outcomes from the store and
-    run them through values_by_terms (devig, sharp weights, terms partitioning,
-    lone-side drop). That requires storing the full Outcome/Terms in the quote
-    log, which is not yet done. For now, we at least handle the No-side
-    correctly (single complement, not double).
+    The pairing fails closed:
+    - Whole-number lines (e.g., KC -3) don't pair with the other side's
+      whole-number line (BUF +3 is "margin <= 2", not the complement of
+      "margin >= 4"), so those venues are skipped.
+    - Lone sides (only one side quoted) are skipped, not passed through.
+    - Stale quotes (older than max_quote_age_s) are ignored.
+
+    Each side is looked up under its own key, so there's nothing to flip:
+    Yes and No listings get their own devigged probabilities directly.
 
     Called periodically; captures for events that started since the last call.
     Returns the number of closing lines captured.
     """
     from .calls import ClosingLine
-    from .pricing import outcome_key
+    from .pricing import devig, outcome_key
 
     n = 0
+    # Get model parameters for devig and weighting
+    model = ctx.model
+    method = getattr(model, "_method", "power")
+    book_weights = getattr(model, "_book_weights", {})
+    default_weight = getattr(model, "_default_weight", 1.0)
+    max_age_s = getattr(model, "_max_quote_age_s", 900.0)
+
     for listings in [ctx.resolver.listings_for(ex.venue_id) for ex in ctx.exchanges]:
         for listing in listings:
             start = ctx.resolver.event_start(listing.key)
@@ -587,31 +598,66 @@ def capture_closing_lines(
             if ctx.store.has_closing_line(okey):
                 continue
 
-            # Get the latest quotes before event start
-            quotes = ctx.store.latest_quotes_before(okey, start)
-            if not quotes:
+            # Get the exact complement. If None (e.g., pushes/ties don't have
+            # a clean complement), skip: fail closed.
+            comp = listing.outcome.complement()
+            if comp is None:
+                continue
+            comp_key = outcome_key(comp)
+
+            # Get latest quotes for both sides before event start
+            own_quotes = ctx.store.latest_quotes_before(okey, start)
+            comp_quotes = ctx.store.latest_quotes_before(comp_key, start)
+
+            # Index by venue: {venue: (price, valid_at)}
+            mine = {v: (p, va) for v, p, va in own_quotes}
+            theirs = {v: (p, va) for v, p, va in comp_quotes}
+
+            # Pair by venue, devig each pair, weight by sharp weights
+            pairs = []  # list of (devigged_prob, weight)
+            for venue in mine.keys() & theirs.keys():
+                p_own, va_own = mine[venue]
+                p_comp, va_comp = theirs[venue]
+
+                # Ignore stale quotes: if the feed died before kickoff,
+                # "latest before start" is not a closing line
+                try:
+                    va_own_dt = datetime.fromisoformat(va_own)
+                    va_comp_dt = datetime.fromisoformat(va_comp)
+                except (ValueError, TypeError):
+                    continue
+                age_own = (start - va_own_dt).total_seconds()
+                age_comp = (start - va_comp_dt).total_seconds()
+                if age_own > max_age_s or age_comp > max_age_s:
+                    continue
+
+                # Devig the pair. If it fails (e.g., invalid probs), skip.
+                try:
+                    devigged = devig([p_own, p_comp], method)
+                except (ValueError, ZeroDivisionError):
+                    continue
+                # devig returns [prob_own, prob_comp]; we want prob_own
+                prob = devigged[0]
+
+                # Weight by sharp weights
+                weight = book_weights.get(venue, default_weight)
+                pairs.append((prob, weight))
+
+            if not pairs:
                 continue
 
-            # Simple consensus: average of latest prices per venue.
-            # TODO: Replace with full devig pipeline (values_by_terms) once
-            # the quote log stores enough to rebuild PricedOutcome.
-            prices = [price for _, price, _ in quotes]
-            if not prices:
+            # Weighted average
+            total_w = sum(w for _, w in pairs)
+            if total_w <= 0:
                 continue
-            prob = sum(prices) / len(prices)
-
-            # For No listings, the stored quotes are Yes probabilities (the book
-            # prices the Yes side). Flip exactly once to get the No probability.
-            # The bug was flipping twice: once when storing, once here.
-            if listing.key.side == "no":
-                prob = 1.0 - prob
+            prob = sum(p * w for p, w in pairs) / total_w
 
             try:
                 ctx.store.record_closing_line(
                     ClosingLine(
                         outcome_key=okey,
                         sharp_close_prob=prob,
-                        source="pregame_consensus",
+                        source="pregame_consensus_devigged",
                         captured_at=at,
                     )
                 )
