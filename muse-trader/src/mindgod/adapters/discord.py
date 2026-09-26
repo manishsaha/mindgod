@@ -15,7 +15,7 @@ from typing import Any
 import httpx
 
 from mindgod.application.opportunities import Opportunity
-from mindgod.application.ports import Notifier
+from mindgod.application.ports import Notifier, OpsPoster
 from mindgod.application.pricing import outcome_key
 
 log = logging.getLogger("mindgod.adapters.discord")
@@ -180,3 +180,24 @@ class DiscordNotifier(Notifier):
                 log.warning("discord rejected: %s", resp.status_code)
                 return False
         return False
+
+
+class DiscordOpsPoster(OpsPoster):
+    """Plain-text posts to the ops channel: credit burn, poll failures.
+
+    Never raises: ops telemetry must not take down the loop that reports it.
+    """
+
+    def __init__(self, webhook_url: str) -> None:
+        self._webhook_url = webhook_url
+
+    async def post(self, text: str) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(
+                    self._webhook_url,
+                    json={"username": "MindGod-ops", "content": text},
+                )
+                resp.raise_for_status()
+        except Exception:
+            log.exception("ops webhook post failed")

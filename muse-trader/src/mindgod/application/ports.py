@@ -71,8 +71,32 @@ class Fill:
     at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class QuotaStatus:
+    """Credit-burn telemetry from the last sportsbook poll.
+
+    `used` is the x-requests-last header, `remaining` x-requests-remaining.
+    `bookmakers` are the bookmaker keys the API actually returned, so a
+    poll that silently drops Pinnacle is visible without guessing.
+    """
+
+    used: int | None
+    remaining: int | None
+    bookmakers: tuple[str, ...] = ()
+
+
+class OpsPoster(Protocol):
+    """Fire-and-forget text posts to the ops channel (credit burn, errors)."""
+
+    async def post(self, text: str) -> None: ...
+
+
 class SportsbookSource(Protocol):
     async def priced_outcomes(self) -> list[PricedOutcome]: ...
+
+    def quota_status(self) -> QuotaStatus | None:
+        """Credit-burn telemetry from the last poll, if the source tracks it."""
+        ...
 
 
 class ExchangeSource(Protocol):
@@ -142,6 +166,16 @@ class FairValueModel(Protocol):
     @property
     def max_quote_age_s(self) -> float:
         """Quotes confirmed longer ago than this are never used."""
+        ...
+
+    @property
+    def nfl_tie_prob(self) -> float:
+        """ADR-0011: P(an NFL game ties), for the tie-refund conversion."""
+        ...
+
+    @property
+    def nfl_tie_prob_se(self) -> float:
+        """ADR-0011: uncertainty on the tie rate, added in quadrature."""
         ...
 
 

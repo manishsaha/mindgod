@@ -48,12 +48,14 @@ from .ports import (
     Notifier,
     ObservationStore,
     OpportunityDetector,
+    OpsPoster,
     PricedOutcome,
     ProbablePitcherSource,
     SportsbookSource,
 )
 from .pricing import terms_key
 from .risk import RiskPolicy
+from .tie import find_tie_adjusted_fair, tie_aware_counterpart, tie_close_basis
 
 log = logging.getLogger("mindgod.service")
 
@@ -76,6 +78,9 @@ class ServiceContext:
     risk: RiskPolicy
     store: ObservationStore
     notifier: Notifier | None = None
+    # Ops channel (DISCORD_WEBHOOK_OPS): credit burn and poll failures.
+    # Never the calls webhook: quota telemetry must not page the trader.
+    ops_poster: OpsPoster | None = None
     horizon_days: int = 7
     # Move check: suppress an opportunity when the exchange mid moved more
     # than this (in probability) since the sportsbook prices were refreshed.
@@ -126,6 +131,36 @@ def _spawn_notify(ctx: ServiceContext, notifier: Notifier, opp: Opportunity) -> 
     task = asyncio.create_task(_notify_safely(notifier, opp))
     ctx.notify_tasks.add(task)
     task.add_done_callback(ctx.notify_tasks.discard)
+
+
+async def _post_ops_safely(poster: OpsPoster, text: str) -> None:
+    try:
+        await poster.post(text)
+    except Exception:
+        log.exception("ops post failed")
+
+
+def _post_ops(ctx: ServiceContext, text: str) -> None:
+    """Fire-and-forget text to the ops channel; a no-op without a poster."""
+    if ctx.ops_poster is None:
+        return
+    task = asyncio.create_task(_post_ops_safely(ctx.ops_poster, text))
+    ctx.notify_tasks.add(task)
+    task.add_done_callback(ctx.notify_tasks.discard)
+
+
+def _report_quota(ctx: ServiceContext) -> None:
+    """Post the Odds API credit burn to #ops after every poll."""
+    if ctx.ops_poster is None or ctx.sportsbook is None:
+        return
+    quota = ctx.sportsbook.quota_status()
+    if quota is None:
+        return
+    books = ",".join(quota.bookmakers) if quota.bookmakers else "none"
+    _post_ops(
+        ctx,
+        f"Odds API poll: used {quota.used}, remaining {quota.remaining} (books: {books})",
+    )
 
 
 def _mid_price(book: OrderBook) -> float | None:
@@ -444,6 +479,17 @@ async def tick(ctx: ServiceContext, priced: list[PricedOutcome]) -> list[Opportu
             )
             fair = fair_by_terms.get(key, {}).get(yes_outcome)
             if fair is None:
+                # ADR-0011: the book's moneyline refunds on a tie while the
+                # listing settles No. Convert the tie-refunding consensus
+                # instead of rejecting on the terms mismatch.
+                fair = find_tie_adjusted_fair(
+                    fair_by_terms,
+                    yes_outcome=yes_outcome,
+                    listing_terms=listing.terms,
+                    tie_prob=ctx.model.nfl_tie_prob,
+                    tie_prob_se=ctx.model.nfl_tie_prob_se,
+                )
+            if fair is None:
                 continue
             # ADR-0009: pitcher rule compatibility. The terms_key excludes the
             # pitcher rule, so MLB prices with UNKNOWN rule match ACTION
@@ -555,6 +601,8 @@ def _close_for_outcome(
     model: FairValueModel,
     outcome: Outcome,
     event_start: datetime,
+    *,
+    tie_prob: float | None = None,
 ) -> tuple[float | None, str]:
     """Devigged sharp consensus for one outcome, or (None, reason).
 
@@ -568,16 +616,29 @@ def _close_for_outcome(
     quotes (gated on confirmation age, recorded_at, per ADR-0007) are
     ignored.
 
+    When tie_prob is set (ADR-0011), `outcome` must be the yes basis of an
+    NFL moneyline: it pairs with the book's other side ("home margin <=
+    -1", the tie-aware counterpart, not the exact complement "home margin
+    <= 0" which the book never quotes), and the devigged P(win | no tie)
+    is converted to the unconditional P(win).
+
     Shared by the live capture loop and the recompute migration so the
     two cannot drift apart.
     """
     from .pricing import devig, outcome_key
 
-    # Get the exact complement. If None (e.g., pushes/ties don't have
-    # a clean complement), skip: fail closed.
-    comp = outcome.complement()
-    if comp is None:
-        return None, "no_complement"
+    if tie_prob is None:
+        # Get the exact complement. If None (e.g., pushes/ties don't have
+        # a clean complement), skip: fail closed.
+        comp = outcome.complement()
+        if comp is None:
+            return None, "no_complement"
+    else:
+        # ADR-0011: pair the yes basis with the book's other moneyline
+        # side. Anything that is not a moneyline shape fails closed.
+        comp = tie_aware_counterpart(outcome)
+        if comp is None:
+            return None, "no_complement"
     okey = outcome_key(outcome)
     comp_key = outcome_key(comp)
 
@@ -642,6 +703,10 @@ def _close_for_outcome(
         prob = model.consensus(venue_probs)
     except ValueError:
         return None, "no_consensus"
+    if tie_prob is not None:
+        # ADR-0011: the devigged pair is P(win | no tie); the listing
+        # settles No on a tie, so convert to the unconditional P(win).
+        prob = prob * (1.0 - tie_prob)
     return prob, "paired"
 
 
@@ -698,9 +763,25 @@ def capture_closing_lines(
             # Each side is looked up under its own key, so there's nothing
             # to flip: Yes and No listings get their own devigged
             # probabilities directly.
-            prob, _reason = _close_for_outcome(ctx.store, ctx.model, listing.outcome, start)
+            #
+            # ADR-0011: an NFL moneyline listing settles No on a tie while
+            # the book quotes refund it, so the exact complement never
+            # pairs. Pair the yes basis under the tie rule instead; a
+            # No-side listing's close is 1 - P(yes), which puts the tie
+            # mass on the No side.
+            tie_basis = tie_close_basis(listing)
+            basis = tie_basis if tie_basis is not None else listing.outcome
+            prob, _reason = _close_for_outcome(
+                ctx.store,
+                ctx.model,
+                basis,
+                start,
+                tie_prob=ctx.model.nfl_tie_prob if tie_basis is not None else None,
+            )
             if prob is None:
                 continue
+            if tie_basis is not None and listing.key.side == "no":
+                prob = 1.0 - prob
 
             try:
                 ctx.store.record_closing_line(
@@ -1030,6 +1111,9 @@ async def run_forever(
                         "sportsbook refresh failed; keeping %d stale prices",
                         len(priced),
                     )
+                    _post_ops(ctx, "Odds API poll failed; keeping stale prices.")
+                else:
+                    _report_quota(ctx)
             opps = await tick(ctx, priced)
             if now_ts - last_discovery >= discovery_interval_s:
                 await _discover(ctx)

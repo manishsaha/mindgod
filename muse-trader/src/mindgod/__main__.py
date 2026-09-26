@@ -13,7 +13,7 @@ import os
 from decimal import Decimal
 
 from mindgod.adapters.config import PollingConfig, load_settings
-from mindgod.adapters.discord import DiscordNotifier
+from mindgod.adapters.discord import DiscordNotifier, DiscordOpsPoster
 from mindgod.adapters.execution import make_execution
 from mindgod.adapters.kalshi import KalshiExchange
 from mindgod.adapters.listings import RegistryResolver, build_event, build_listing
@@ -30,10 +30,39 @@ from mindgod.domain.venues import VenueId
 
 log = logging.getLogger("mindgod")
 
+# Secrets that must be present for a production start. Missing values fail
+# loudly instead of silently disabling components; the only way to get the
+# old soft behavior is the explicit MINDGOD_SOFT_STARTUP=1 flag (tests, dev).
+REQUIRED_ENV = (
+    "ODDS_API_KEY",
+    "DISCORD_WEBHOOK_URL",
+    "DISCORD_WEBHOOK_OPS",
+    "MINDGOD_DB_PATH",
+)
+SOFT_STARTUP_FLAG = "MINDGOD_SOFT_STARTUP"
+
+
+def _require_env() -> None:
+    missing = [var for var in REQUIRED_ENV if not os.environ.get(var)]
+    if not missing:
+        return
+    if os.environ.get(SOFT_STARTUP_FLAG) == "1":
+        log.warning(
+            "soft startup: missing %s; dependent components disabled",
+            ", ".join(missing),
+        )
+        return
+    raise SystemExit(
+        "missing required environment variables: "
+        + ", ".join(missing)
+        + f". Set them, or set {SOFT_STARTUP_FLAG}=1 for soft mode."
+    )
+
 
 def build_context(
     config_path: str | None, bankroll: Decimal, live_flag: bool
 ) -> tuple[ServiceContext, PollingConfig]:
+    _require_env()
     settings = load_settings(config_path)
 
     resolver = RegistryResolver()
@@ -63,7 +92,16 @@ def build_context(
     # listings only ever look up h2h outcomes, so a moneyline-only deployment
     # can safely run h2h-only.
     odds_markets = os.environ.get("ODDS_API_MARKETS", "h2h,spreads,totals")
-    sportsbook = OddsApiSource(api_key=odds_key, markets=odds_markets) if odds_key else None
+    # ODDS_API_REGIONS controls credit burn and Pinnacle coverage: Pinnacle
+    # is a eu-region book, so regions=us alone never returns it. Whether the
+    # eu leg costs extra credits is settled by the x-requests-last header,
+    # reported to #ops after every poll.
+    odds_regions = os.environ.get("ODDS_API_REGIONS", "us,eu")
+    sportsbook = (
+        OddsApiSource(api_key=odds_key, markets=odds_markets, regions=odds_regions)
+        if odds_key
+        else None
+    )
     if sportsbook is None:
         log.warning("ODDS_API_KEY not set: running without sportsbook prices")
 
@@ -82,6 +120,10 @@ def build_context(
         if webhook
         else None
     )
+    # Ops traffic (credit burn, poll failures) goes to its own channel and
+    # never falls back to the calls webhook.
+    ops_webhook = os.environ.get("DISCORD_WEBHOOK_OPS", "")
+    ops_poster = DiscordOpsPoster(ops_webhook) if ops_webhook else None
 
     engine = settings.engine
     detector_cfg = DetectorConfig(
@@ -110,11 +152,14 @@ def build_context(
             min_standard_error=settings.pricing.min_standard_error,
             max_quote_age_s=settings.pricing.max_quote_age_s,
             stale_se_per_minute=settings.pricing.stale_se_per_minute,
+            nfl_tie_prob=settings.pricing.nfl_tie_prob,
+            nfl_tie_prob_se=settings.pricing.nfl_tie_prob_se,
         ),
         detector=detector,
         risk=ExposureLimits(max_exposure_per_event=Decimal(engine.max_exposure_per_event)),
         store=Store(os.environ.get("MINDGOD_DB_PATH", "mindgod.db")),
         notifier=notifier,
+        ops_poster=ops_poster,
         horizon_days=engine.horizon_days,
         max_kalshi_move=engine.max_kalshi_move,
         move_check_max_spread=getattr(engine, "move_check_max_spread", 0.06),

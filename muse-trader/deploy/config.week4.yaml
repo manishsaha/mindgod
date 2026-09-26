@@ -18,6 +18,9 @@ pricing:
   min_standard_error: 0.02
   max_quote_age_s: 900
   stale_se_per_minute: 0.001
+  # ADR-0011: NFL tie rate for the moneyline tie adjustment.
+  nfl_tie_prob: 0.004
+  nfl_tie_prob_se: 0.003
   book_weights:
     pinnacle: 3.0
     circa: 3.0

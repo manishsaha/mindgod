@@ -7,8 +7,10 @@
 # - Alerts when the container is down or the DB has not been written
 #   for STALL_AFTER_MIN (default 12): a silent crash must never look
 #   like a quiet slate.
-# Reads the webhook from ../.env (prefers DISCORD_WEBHOOK_OPS, falls
-# back to DISCORD_WEBHOOK_URL). Never prints secrets.
+# Reads the webhook from DISCORD_WEBHOOK_OPS in ../.env. There is
+# deliberately no fallback to DISCORD_WEBHOOK_URL: ops traffic must never
+# land in #calls, and a missing ops webhook is a configuration failure that
+# must be visible, not a silent no-op. Never prints secrets.
 set -u
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -24,9 +26,6 @@ webhook() {
   local w=""
   if [ -f "$ENV_FILE" ]; then
     w="$(grep -E '^DISCORD_WEBHOOK_OPS=' "$ENV_FILE" | cut -d= -f2- | tr -d ' ')"
-    if [ -z "$w" ]; then
-      w="$(grep -E '^DISCORD_WEBHOOK_URL=' "$ENV_FILE" | cut -d= -f2- | tr -d ' ')"
-    fi
   fi
   printf '%s' "$w"
 }
@@ -34,7 +33,10 @@ webhook() {
 send() { # $1 = message text
   local hook
   hook="$(webhook)"
-  [ -n "$hook" ] || return 0
+  if [ -z "$hook" ]; then
+    echo "watchdog: DISCORD_WEBHOOK_OPS is not set in $ENV_FILE; refusing to send (no fallback to the calls webhook)" >&2
+    return 1
+  fi
   local payload
   payload="$(python3 -c 'import json,sys; print(json.dumps({"content": sys.stdin.read()}))' <<< "$1")"
   curl -s -m 15 -H "Content-Type: application/json" -d "$payload" "$hook" > /dev/null

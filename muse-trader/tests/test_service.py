@@ -114,6 +114,14 @@ class FakeModel:
     def values_by_terms(self, priced, as_of):
         return self.by_terms
 
+    @property
+    def nfl_tie_prob(self):
+        return 0.004
+
+    @property
+    def nfl_tie_prob_se(self):
+        return 0.003
+
 
 class FakeDetector:
     def __init__(self):

@@ -18,7 +18,7 @@ from typing import Any
 
 import httpx
 
-from mindgod.application.ports import PricedOutcome, SportsbookSource
+from mindgod.application.ports import PricedOutcome, QuotaStatus, SportsbookSource
 from mindgod.domain.primitives import Observation
 from mindgod.domain.propositions import (
     Comparator,
@@ -43,6 +43,16 @@ log = logging.getLogger("mindgod.adapters.odds_api")
 
 BASE = "https://api.the-odds-api.com/v4"
 SPORT_LEAGUE = {"americanfootball_nfl": League.NFL, "baseball_mlb": League.MLB}
+
+
+def _header_int(value: str | None) -> int | None:
+    """Parse a quota header; None when the API does not send it."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 
 def _valid_at(market: dict[str, Any], book: dict[str, Any], now: datetime) -> datetime:
@@ -79,12 +89,18 @@ class OddsApiSource(SportsbookSource):
         sports: tuple[str, ...] = ("americanfootball_nfl",),
         bookmakers: str = "draftkings,fanduel,pinnacle",
         markets: str = "h2h,spreads,totals",
+        regions: str = "us,eu",
     ) -> None:
         self._api_key = api_key
         self._sports = sports
         self._bookmakers = bookmakers
         self._markets = markets
+        self._regions = regions
         self._mlb_warned: set[str] = set()
+        self._quota: QuotaStatus | None = None
+
+    def quota_status(self) -> QuotaStatus | None:
+        return self._quota
 
     async def priced_outcomes(self) -> list[PricedOutcome]:
         now = datetime.now(UTC)
@@ -97,7 +113,7 @@ class OddsApiSource(SportsbookSource):
                         f"/sports/{sport}/odds",
                         params={
                             "apiKey": self._api_key,
-                            "regions": "us,eu",
+                            "regions": self._regions,
                             "markets": self._markets,
                             "oddsFormat": "american",
                             "bookmakers": self._bookmakers,
@@ -108,6 +124,24 @@ class OddsApiSource(SportsbookSource):
                 except Exception:
                     log.exception("odds api failed for %s", sport)
                     continue
+                books = sorted(
+                    {
+                        str(book.get("key", "unknown"))
+                        for data in events
+                        for book in data.get("bookmakers", [])
+                    }
+                )
+                log.info(
+                    "odds api %s: %d events, bookmakers=%s",
+                    sport,
+                    len(events),
+                    ",".join(books) if books else "none",
+                )
+                self._quota = QuotaStatus(
+                    used=_header_int(resp.headers.get("x-requests-last")),
+                    remaining=_header_int(resp.headers.get("x-requests-remaining")),
+                    bookmakers=tuple(books),
+                )
                 out.extend(self._parse_sport(league, events, now))
         return out
 

@@ -32,7 +32,7 @@ from mindgod.domain.propositions import (
 )
 from mindgod.domain.sports import EventId, League, Period, PlayerId, TeamId
 from mindgod.domain.stats import Stat
-from mindgod.domain.terms import Terms
+from mindgod.domain.terms import AbsenceRule, PostponementRule, Terms, VoidPolicy
 from mindgod.domain.valuation import FairValue
 from mindgod.domain.venues import ListingKey, VenueId
 
@@ -130,6 +130,38 @@ def terms_key(terms: Terms) -> str:
             pitchers,
         ]
     )
+
+
+def parse_terms_key(key: str) -> tuple[Outcome | None, VoidPolicy] | None:
+    """Inverse of terms_key: the refund outcome and void policy a key was made from.
+
+    The refund outcome key is 9 pipe-joined parts (or "" when there is no
+    refund); the void policy is the 3 trailing parts. Returns None when the
+    key does not parse. The pitcher rule is not part of the key, so the
+    reconstructed policy carries the default.
+    """
+    parts = key.split("|")
+    if parts[0] == "":
+        refunds: Outcome | None = None
+        rest = parts[1:]
+    else:
+        if len(parts) < 9:
+            return None
+        refunds = parse_outcome_key("|".join(parts[:9]))
+        if refunds is None:
+            return None
+        rest = parts[9:]
+    if len(rest) != 3:
+        return None
+    try:
+        void = VoidPolicy(
+            on_player_absent=AbsenceRule(rest[0]),
+            on_postponement=PostponementRule(rest[1]),
+            listed_pitchers=frozenset(PlayerId(p) for p in rest[2].split(",") if p),
+        )
+    except ValueError:
+        return None
+    return refunds, void
 
 
 def partition_by_terms(
@@ -286,6 +318,8 @@ class WeightedConsensusModel:
         min_standard_error: float = 0.0,
         max_quote_age_s: float = 900.0,
         stale_se_per_minute: float = 0.001,
+        nfl_tie_prob: float = 0.004,
+        nfl_tie_prob_se: float = 0.003,
     ) -> None:
         self._method = method
         self._book_weights = book_weights or {}
@@ -300,6 +334,11 @@ class WeightedConsensusModel:
         # ...and quotes approaching the gate carry a wider error bar, so an
         # aging consensus is penalized before it is dropped.
         self._stale_se_per_minute = stale_se_per_minute
+        # ADR-0011: the NFL tie rate used to convert tie-refunding book
+        # moneylines to the listing's no-tie terms, and its uncertainty,
+        # added to fair-value standard errors in quadrature (as in ADR-0007).
+        self._nfl_tie_prob = nfl_tie_prob
+        self._nfl_tie_prob_se = nfl_tie_prob_se
 
     def _weight(self, venue_id: VenueId) -> float:
         return self._book_weights.get(str(venue_id), self._default_weight)
@@ -320,6 +359,16 @@ class WeightedConsensusModel:
     @property
     def max_quote_age_s(self) -> float:
         return self._max_quote_age_s
+
+    @property
+    def nfl_tie_prob(self) -> float:
+        """ADR-0011: P(an NFL game ties), for the tie-refund conversion."""
+        return self._nfl_tie_prob
+
+    @property
+    def nfl_tie_prob_se(self) -> float:
+        """ADR-0011: uncertainty on the tie rate, added in quadrature."""
+        return self._nfl_tie_prob_se
 
     def values_by_terms(
         self, priced: list[PricedOutcome], as_of: datetime

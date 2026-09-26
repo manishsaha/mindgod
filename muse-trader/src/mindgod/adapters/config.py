@@ -57,6 +57,11 @@ class PricingConfig:
     # ADR-0009: extra SE (in quadrature) when the book's pitcher rule is
     # UNKNOWN or LISTED vs the venue's ACTION.
     pitcher_rule_se: float = 0.01
+    # ADR-0011: the NFL tie rate used to convert tie-refunding book
+    # moneylines to no-tie listing terms, and its uncertainty (added to
+    # fair-value SE in quadrature, as in ADR-0007).
+    nfl_tie_prob: float = 0.004
+    nfl_tie_prob_se: float = 0.003
 
 
 @dataclass(frozen=True, slots=True)
