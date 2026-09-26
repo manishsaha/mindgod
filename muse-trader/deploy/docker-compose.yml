@@ -1,0 +1,23 @@
+# MindGod shadow mode: paper execution, Discord alerts, persistent DB.
+#
+# From this directory:
+#   cp ../.env.example ../.env   # then fill in your secrets (never commit)
+#   docker compose up -d --build
+#
+# The DB lives at deploy/data/mindgod.db on the host (bind mount, not a
+# named volume): visible for the watchdog, survives container recreation
+# and host reboots. It is NOT on the container's temporary disk.
+services:
+  mindgod:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: mindgod:shadow
+    env_file:
+      - ../.env
+    environment:
+      MINDGOD_DB_PATH: /data/mindgod.db
+    volumes:
+      - ./data:/data
+      - ./config.week4.yaml:/app/config.yaml:ro
+    restart: unless-stopped

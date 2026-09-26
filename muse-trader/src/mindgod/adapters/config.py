@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import yaml
 
@@ -117,8 +117,10 @@ class Settings:
 def _build[T](cls: type[T], data: Any) -> T:
     if not isinstance(data, dict):
         return cls()
-    probe: Any = cls()
-    known = {f.name for f in fields(probe)}
+    # Introspect the class, never instantiate it to probe: some specs
+    # (ListingSpec) have required fields, so cls() raises TypeError and
+    # no config with listings could ever load.
+    known = {f.name for f in fields(cast(Any, cls))}
     return cls(**{k: v for k, v in data.items() if k in known})
 
 

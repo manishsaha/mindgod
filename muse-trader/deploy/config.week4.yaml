@@ -1,0 +1,189 @@
+# MindGod weekend shadow config: NFL week 4, paper execution.
+# All 15 week-4 games mapped to their Kalshi home-team moneylines
+# (verified live with real orderbook depth on Fri Sep 25 2026).
+# Execution is paper: alerts fire, fills are simulated, no real orders.
+
+polling:
+  exchange_interval_s: 60
+  sportsbook_interval_s: 300
+  discovery_interval_s: 3600
+
+pricing:
+  devig_method: power
+  min_standard_error: 0.02
+  max_quote_age_s: 900
+  stale_se_per_minute: 0.001
+  book_weights:
+    pinnacle: 3.0
+    circa: 3.0
+    draftkings: 1.0
+    fanduel: 1.0
+
+engine:
+  min_net_edge: "0.02"
+  kelly_fraction: "0.25"
+  max_stake_per_bet: "100.0"
+  max_exposure_per_event: "500.0"
+  slippage: "0.005"
+  uncertainty_aversion: "10.0"
+  threshold_widening: "2.0"
+  horizon_days: 7
+  max_kalshi_move: 0.03
+  move_check_max_spread: 0.06
+  reaction_delay_s: 60
+  kalshi_discovery_series: ["KXNFLGAME", "KXMLBGAME"]
+
+fees:
+  kalshi: {taker_rate: "0.07", maker_rate: "0.0"}
+  polymarket: {taker_rate: "0.03", maker_rate: "0.0"}
+
+alerts:
+  cooldown_s: 900
+  min_edge_move: "0.01"
+
+execution:
+  mode: paper  # shadow: paper fills only. live needs mode=live AND --live
+
+# Registered markets: Kalshi home-team moneylines, side yes.
+# Event codes are AWAY+HOME (verified against the week 4 schedule).
+listings:
+  # Sun 1:00 PM ET kickoffs
+  - venue: kalshi
+    market_id: KXNFLGAME-26SEP27LACBUF-BUF
+    side: yes
+    league: nfl
+    home: BUF
+    away: LAC
+    start: "2026-09-27T17:00:00Z"
+    outcome_kind: moneyline
+    outcome_team: home
+  - venue: kalshi
+    market_id: KXNFLGAME-26SEP27CARCLE-CLE
+    side: yes
+    league: nfl
+    home: CLE
+    away: CAR
+    start: "2026-09-27T17:00:00Z"
+    outcome_kind: moneyline
+    outcome_team: home
+  - venue: kalshi
+    market_id: KXNFLGAME-26SEP27NYJDET-DET
+    side: yes
+    league: nfl
+    home: DET
+    away: NYJ
+    start: "2026-09-27T17:00:00Z"
+    outcome_kind: moneyline
+    outcome_team: home
+  - venue: kalshi
+    market_id: KXNFLGAME-26SEP27HOUIND-IND
+    side: yes
+    league: nfl
+    home: IND
+    away: HOU
+    start: "2026-09-27T17:00:00Z"
+    outcome_kind: moneyline
+    outcome_team: home
+  - venue: kalshi
+    market_id: KXNFLGAME-26SEP27NEJAC-JAC
+    side: yes
+    league: nfl
+    home: JAX
+    away: NE
+    start: "2026-09-27T17:00:00Z"
+    outcome_kind: moneyline
+    outcome_team: home
+  - venue: kalshi
+    market_id: KXNFLGAME-26SEP27KCMIA-MIA
+    side: yes
+    league: nfl
+    home: MIA
+    away: KC
+    start: "2026-09-27T17:00:00Z"
+    outcome_kind: moneyline
+    outcome_team: home
+  - venue: kalshi
+    market_id: KXNFLGAME-26SEP27TENNYG-NYG
+    side: yes
+    league: nfl
+    home: NYG
+    away: TEN
+    start: "2026-09-27T17:00:00Z"
+    outcome_kind: moneyline
+    outcome_team: home
+  - venue: kalshi
+    market_id: KXNFLGAME-26SEP27CINPIT-PIT
+    side: yes
+    league: nfl
+    home: PIT
+    away: CIN
+    start: "2026-09-27T17:00:00Z"
+    outcome_kind: moneyline
+    outcome_team: home
+  - venue: kalshi
+    market_id: KXNFLGAME-26SEP27SEAWAS-WAS
+    side: yes
+    league: nfl
+    home: WAS
+    away: SEA
+    start: "2026-09-27T17:00:00Z"
+    outcome_kind: moneyline
+    outcome_team: home
+  # Sun 4:05 PM ET kickoffs
+  - venue: kalshi
+    market_id: KXNFLGAME-26SEP27ARISF-SF
+    side: yes
+    league: nfl
+    home: SF
+    away: ARI
+    start: "2026-09-27T20:05:00Z"
+    outcome_kind: moneyline
+    outcome_team: home
+  - venue: kalshi
+    market_id: KXNFLGAME-26SEP27MINTB-TB
+    side: yes
+    league: nfl
+    home: TB
+    away: MIN
+    start: "2026-09-27T20:05:00Z"
+    outcome_kind: moneyline
+    outcome_team: home
+  # Sun 4:25 PM ET kickoffs
+  - venue: kalshi
+    market_id: KXNFLGAME-26SEP27LVNO-NO
+    side: yes
+    league: nfl
+    home: NO
+    away: LV
+    start: "2026-09-27T20:25:00Z"
+    outcome_kind: moneyline
+    outcome_team: home
+  - venue: kalshi
+    market_id: KXNFLGAME-26SEP27BALDAL-DAL
+    side: yes
+    league: nfl
+    home: DAL
+    away: BAL
+    start: "2026-09-27T20:25:00Z"
+    outcome_kind: moneyline
+    outcome_team: home
+  # Sun 8:20 PM ET kickoff
+  - venue: kalshi
+    market_id: KXNFLGAME-26SEP27LARDEN-DEN
+    side: yes
+    league: nfl
+    home: DEN
+    away: LAR
+    start: "2026-09-28T00:20:00Z"
+    outcome_kind: moneyline
+    outcome_team: home
+  # Mon 8:15 PM ET kickoff
+  - venue: kalshi
+    market_id: KXNFLGAME-26SEP28PHICHI-CHI
+    side: yes
+    league: nfl
+    home: CHI
+    away: PHI
+    start: "2026-09-29T00:15:00Z"
+    outcome_kind: moneyline
+    outcome_team: home
