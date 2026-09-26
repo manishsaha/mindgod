@@ -39,6 +39,9 @@ def report_by_price_bucket(db_path: str) -> list[GradeSlice]:
            FROM call_grades g
            JOIN calls c ON c.call_id = g.call_id
            LEFT JOIN paper_fills p ON p.call_id = g.call_id AND p.kind = 'reaction'
+           WHERE g.method_version = (SELECT MAX(g2.method_version)
+                                     FROM call_grades g2
+                                     WHERE g2.call_id = g.call_id)
         """
     ).fetchall()
     conn.close()
@@ -73,6 +76,9 @@ def report_summary(db_path: str) -> GradeSlice:
                   g.edge_half_life_s, p.filled
            FROM call_grades g
            LEFT JOIN paper_fills p ON p.call_id = g.call_id AND p.kind = 'reaction'
+           WHERE g.method_version = (SELECT MAX(g2.method_version)
+                                     FROM call_grades g2
+                                     WHERE g2.call_id = g.call_id)
         """
     ).fetchall()
     conn.close()

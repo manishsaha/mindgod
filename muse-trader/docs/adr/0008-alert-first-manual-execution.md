@@ -1,25 +1,34 @@
 # ADR-0008: Alert-first; manual execution graded by paper tracking
 
 Date: 2026-09-25
-Status: Accepted. Amends ADR-0003. Implementation: partial.
+Status: Accepted. Amends ADR-0003. Implementation: pending.
 
 ## Implementation status
 
-Part 1 (alerts, paper fills, snapshots): complete.
-Part 2 (data model, closing lines, settlements, grading): the tables, functions,
-and wiring are in place. `capture_closing_lines()` queries the quote log for
-pre-game consensus. `_check_settlements()` fetches Kalshi market results and
-records settlements. `_grade_settled_call()` records simplified CLV/P&L grades.
-The full `grade_call()` reconstruction from stored data is deferred; the
-simplified grader records essential metrics so the evaluation loop runs.
+Verified complete at `af2b1b7` (2026-09-26):
+- Alerts
+- Reaction-time paper fills
+- Decay snapshots
+- Grading loop from closing lines through settlement and grades
 
-Known gaps:
+Remaining:
 - Discord "Took it" button requires Interactions API setup. Manual fills are
   recorded directly in the DB for now.
-- Snapshot and reaction-fill tasks are in-memory. A restart loses pending
-  tasks. Acceptable for now.
 - Same-game exposure is not yet included in the alert text.
+- Snapshot and reaction-fill tasks are in-memory. A restart loses pending
+  tasks.
 - Settlement uses Kalshi market results only. Polymarket settlement is not wired.
+
+Historical recompute (2026-09-26, in review): `closing_lines` and
+`call_grades` are append-only with a `method_version` column. Version 1 rows
+are historical data written by the pre-recompute code; version 2 rows are the
+recomputed closes (devigged via complement pairing) and re-grades. New rows
+are appended, never overwritten; `has_closing_line()` and all readers take
+the latest version. Old MLB No-side keys stored as `margin <= 0` are
+re-normalized to the canonical `margin <= -1` through an `outcome_key_remap`
+table so legacy calls join to their recomputed closes. The recompute CLI
+(`mindgod.application.recompute`) runs dry-run by default and exits nonzero
+in apply mode if the vig-removal sanity check fails.
 
 ## Context
 

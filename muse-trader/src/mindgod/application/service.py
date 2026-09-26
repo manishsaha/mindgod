@@ -24,6 +24,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 
 from mindgod.domain.fees import FeeModel
+from mindgod.domain.propositions import Outcome
 from mindgod.domain.quotes import OrderBook
 from mindgod.domain.sports import League
 from mindgod.domain.terms import Payoff, PitcherRule, Terms, pitcher_rules_compatible
@@ -549,6 +550,101 @@ async def tick(ctx: ServiceContext, priced: list[PricedOutcome]) -> list[Opportu
     return found
 
 
+def _close_for_outcome(
+    store: ObservationStore,
+    model: FairValueModel,
+    outcome: Outcome,
+    event_start: datetime,
+) -> tuple[float | None, str]:
+    """Devigged sharp consensus for one outcome, or (None, reason).
+
+    Pairs the outcome with its exact complement per venue, devigs each
+    pair (removing the vig), and takes a sharp-weighted consensus through
+    the model port: the same math the live fair values use.
+
+    Reason is one of "paired", "no_complement", "no_quotes", "no_pair",
+    "stale", "devig_failed", "no_consensus". Fails closed throughout:
+    whole-number lines don't pair, lone sides are skipped, and stale
+    quotes (gated on confirmation age, recorded_at, per ADR-0007) are
+    ignored.
+
+    Shared by the live capture loop and the recompute migration so the
+    two cannot drift apart.
+    """
+    from .pricing import devig, outcome_key
+
+    # Get the exact complement. If None (e.g., pushes/ties don't have
+    # a clean complement), skip: fail closed.
+    comp = outcome.complement()
+    if comp is None:
+        return None, "no_complement"
+    okey = outcome_key(outcome)
+    comp_key = outcome_key(comp)
+
+    # Get latest quotes for both sides before event start.
+    # Each entry is (venue, price, valid_at, recorded_at).
+    own_quotes = store.latest_quotes_before(okey, event_start)
+    comp_quotes = store.latest_quotes_before(comp_key, event_start)
+    if not own_quotes or not comp_quotes:
+        return None, "no_quotes"
+
+    # Index by venue: {venue: (price, recorded_at)}
+    mine = {v: (p, ra) for v, p, _, ra in own_quotes}
+    theirs = {v: (p, ra) for v, p, _, ra in comp_quotes}
+    shared = mine.keys() & theirs.keys()
+    if not shared:
+        return None, "no_pair"
+
+    # Pair by venue and devig each pair. Staleness is gated on
+    # confirmation age (recorded_at, per ADR-0007): a line that holds
+    # steady before kickoff is still fresh as long as the feed kept
+    # confirming it. If the feed died before kickoff, "the latest
+    # quote before start" is not a closing line.
+    max_age_s = model.max_quote_age_s
+    method = model.devig_method
+    venue_probs = []  # list of (venue, devigged_prob)
+    saw_stale = False
+    saw_devig_failure = False
+    for venue in shared:
+        p_own, ra_own = mine[venue]
+        p_comp, ra_comp = theirs[venue]
+
+        try:
+            ra_own_dt = datetime.fromisoformat(ra_own)
+            ra_comp_dt = datetime.fromisoformat(ra_comp)
+        except (ValueError, TypeError):
+            continue
+        age_own = (event_start - ra_own_dt).total_seconds()
+        age_comp = (event_start - ra_comp_dt).total_seconds()
+        if age_own > max_age_s or age_comp > max_age_s:
+            saw_stale = True
+            continue
+
+        # Devig the pair. If it fails (e.g., invalid probs), skip.
+        try:
+            devigged = devig([p_own, p_comp], method)
+        except (ValueError, ZeroDivisionError):
+            saw_devig_failure = True
+            continue
+        # devig returns [prob_own, prob_comp]; we want prob_own
+        venue_probs.append((venue, devigged[0]))
+
+    if not venue_probs:
+        if saw_stale:
+            return None, "stale"
+        if saw_devig_failure:
+            return None, "devig_failed"
+        return None, "no_pair"
+
+    # Sharp-weighted consensus through the model port: the same math
+    # the live fair values use, so the two cannot drift apart.
+    try:
+        prob = model.consensus(venue_probs)
+    except ValueError:
+        return None, "no_consensus"
+    return prob, "paired"
+
+
 def capture_closing_lines(
     ctx: ServiceContext,
     at: datetime,
@@ -575,13 +671,9 @@ def capture_closing_lines(
     Returns the number of closing lines captured.
     """
     from .calls import ClosingLine
-    from .pricing import devig, outcome_key
+    from .pricing import outcome_key
 
     n = 0
-    model = ctx.model
-    method = model.devig_method
-    max_age_s = model.max_quote_age_s
-
     for listings in [ctx.resolver.listings_for(ex.venue_id) for ex in ctx.exchanges]:
         for listing in listings:
             start = ctx.resolver.event_start(listing.key)
@@ -592,63 +684,17 @@ def capture_closing_lines(
             if not (timedelta(0) <= at - start < timedelta(hours=1)):
                 continue
 
-            # Check if already captured
+            # Check if already captured (version-aware: only the current
+            # method counts).
             okey = outcome_key(listing.outcome)
             if ctx.store.has_closing_line(okey):
                 continue
 
-            # Get the exact complement. If None (e.g., pushes/ties don't have
-            # a clean complement), skip: fail closed.
-            comp = listing.outcome.complement()
-            if comp is None:
-                continue
-            comp_key = outcome_key(comp)
-
-            # Get latest quotes for both sides before event start.
-            # Each entry is (venue, price, valid_at, recorded_at).
-            own_quotes = ctx.store.latest_quotes_before(okey, start)
-            comp_quotes = ctx.store.latest_quotes_before(comp_key, start)
-
-            # Index by venue: {venue: (price, recorded_at)}
-            mine = {v: (p, ra) for v, p, _, ra in own_quotes}
-            theirs = {v: (p, ra) for v, p, _, ra in comp_quotes}
-
-            # Pair by venue and devig each pair. Staleness is gated on
-            # confirmation age (recorded_at, per ADR-0007): a line that holds
-            # steady before kickoff is still fresh as long as the feed kept
-            # confirming it. If the feed died before kickoff, "the latest
-            # quote before start" is not a closing line.
-            venue_probs = []  # list of (venue, devigged_prob)
-            for venue in mine.keys() & theirs.keys():
-                p_own, ra_own = mine[venue]
-                p_comp, ra_comp = theirs[venue]
-
-                try:
-                    ra_own_dt = datetime.fromisoformat(ra_own)
-                    ra_comp_dt = datetime.fromisoformat(ra_comp)
-                except (ValueError, TypeError):
-                    continue
-                age_own = (start - ra_own_dt).total_seconds()
-                age_comp = (start - ra_comp_dt).total_seconds()
-                if age_own > max_age_s or age_comp > max_age_s:
-                    continue
-
-                # Devig the pair. If it fails (e.g., invalid probs), skip.
-                try:
-                    devigged = devig([p_own, p_comp], method)
-                except (ValueError, ZeroDivisionError):
-                    continue
-                # devig returns [prob_own, prob_comp]; we want prob_own
-                venue_probs.append((venue, devigged[0]))
-
-            if not venue_probs:
-                continue
-
-            # Sharp-weighted consensus through the model port: the same math
-            # the live fair values use, so the two cannot drift apart.
-            try:
-                prob = model.consensus(venue_probs)
-            except ValueError:
+            # Each side is looked up under its own key, so there's nothing
+            # to flip: Yes and No listings get their own devigged
+            # probabilities directly.
+            prob, _reason = _close_for_outcome(ctx.store, ctx.model, listing.outcome, start)
+            if prob is None:
                 continue
 
             try:
@@ -732,7 +778,7 @@ async def _check_settlements(ctx: ServiceContext) -> int:
                 n += 1
                 # Grade the call now that we have settlement
                 try:
-                    _grade_settled_call(ctx, call_id, outcome_key, settlement, now)
+                    _grade_settled_call(ctx.store, call_id, outcome_key, settlement, now)
                 except Exception:
                     log.exception("grading failed for %s", call_id)
             except Exception:
@@ -742,17 +788,27 @@ async def _check_settlements(ctx: ServiceContext) -> int:
 
 
 def _grade_settled_call(
-    ctx: ServiceContext,
+    store: ObservationStore,
     call_id: str,
     outcome_key: str,
     settlement: Settlement,
     at: datetime,
+    close_version: int | None = None,
 ) -> None:
     """Grade a call that just settled using the tested grade_call().
 
     Reconstructs PaperFill, ManualFill, CallSnapshot, and ClosingLine from
     the store, then calls grade_call() which handles fees, per-contract
     units, no-fill results, and edge half-life.
+
+    The outcome key is canonicalized through the key-remap table before
+    the closing-line lookup, so calls stored under an older normalization
+    (e.g. MLB "margin <= 0") still join to their recomputed close.
+
+    close_version pins the closing-line method version: None takes the
+    latest version present (production), while the recompute migration
+    pins the current version so a v2 grade never silently mixes in a v1
+    close (it grades P&L-only instead).
     """
     from decimal import Decimal
     from typing import cast
@@ -770,7 +826,7 @@ def _grade_settled_call(
     )
 
     # Fetch call data (for ask_at_alert, limit_price_x, etc.)
-    call_data = ctx.store.get_call(call_id)
+    call_data = store.get_call(call_id)
     if not call_data:
         return
 
@@ -796,7 +852,7 @@ def _grade_settled_call(
 
     # Fetch reaction fill (kind='reaction' specifically, per ADR-0008)
     reaction_fill = None
-    fill_data = ctx.store.get_paper_fill(call_id)
+    fill_data = store.get_paper_fill(call_id)
     if fill_data:
         # ADR-0008: a "no fill" is itself a result; grade_call handles filled=False
         reaction_fill = PaperFill(
@@ -813,7 +869,7 @@ def _grade_settled_call(
 
     # Fetch manual fill (if any)
     manual_fill = None
-    m_data = ctx.store.get_manual_fill(call_id)
+    m_data = store.get_manual_fill(call_id)
     if m_data:
         manual_fill = ManualFill(
             call_id=m_data["call_id"],
@@ -826,7 +882,7 @@ def _grade_settled_call(
 
     # Fetch snapshots
     snapshots = []
-    for r in ctx.store.get_snapshots(call_id):
+    for r in store.get_snapshots(call_id):
         snapshots.append(
             CallSnapshot(
                 call_id=r["call_id"],
@@ -838,9 +894,16 @@ def _grade_settled_call(
             )
         )
 
-    # Fetch closing line
+    # Fetch closing line, canonicalizing the outcome key through the
+    # remap table so older normalizations still join to their close.
+    # close_version=None takes the latest version present; a pinned
+    # version takes that version or nothing (never a silent mix).
     closing_line = None
-    cl_data = ctx.store.get_closing_line(outcome_key)
+    canonical_key = store.canonical_outcome_key(outcome_key)
+    if close_version is None:
+        cl_data = store.get_closing_line(canonical_key)
+    else:
+        cl_data = store.get_closing_line_version(canonical_key, close_version)
     if cl_data:
         closing_line = ClosingLine(
             outcome_key=cl_data["outcome_key"],
@@ -850,7 +913,7 @@ def _grade_settled_call(
         )
 
     grade = grade_call(call, reaction_fill, manual_fill, snapshots, closing_line, settlement, at)
-    ctx.store.record_call_grade(grade)
+    store.record_call_grade(grade)
 
 
 async def run_forever(

@@ -76,6 +76,18 @@ class ManualFill:
     note: str = ""
 
 
+# Method versions for the append-only recompute (ADR-0008 grading loop).
+# Version 1: rows written before the af2b1b7 review round (vig-included
+# closes, or devigged closes gated on valid_at instead of recorded_at, and
+# MLB moneylines that could not pair). Version 2: the current method
+# (devigged complement-pair closes gated on confirmation age, with the MLB
+# full-game no-tie normalization). Old rows are never overwritten or
+# deleted; reports read only the latest version. Bump when the method
+# changes and recompute.
+CLOSING_LINE_METHOD_VERSION = 2
+CALL_GRADE_METHOD_VERSION = 2
+
+
 @dataclass(frozen=True, slots=True)
 class ClosingLine:
     """Last sharp consensus before the event locks."""
@@ -84,6 +96,7 @@ class ClosingLine:
     sharp_close_prob: float
     source: str
     captured_at: datetime
+    method_version: int = CLOSING_LINE_METHOD_VERSION
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +117,7 @@ class CallGrade:
     pnl_manual: float | None
     edge_half_life_s: float | None  # seconds until ask crosses halfway to X
     graded_at: datetime
+    method_version: int = CALL_GRADE_METHOD_VERSION
 
 
 def build_call(

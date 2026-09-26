@@ -19,9 +19,19 @@ from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 
 from mindgod.domain.primitives import Probability
-from mindgod.domain.propositions import Band, CategoryIs, Outcome, Threshold
+from mindgod.domain.propositions import (
+    Band,
+    CategoryIs,
+    Comparator,
+    Outcome,
+    Quantity,
+    Threshold,
+)
+from mindgod.domain.sports import EventId, League, Period, PlayerId, TeamId
+from mindgod.domain.stats import Stat
 from mindgod.domain.terms import Terms
 from mindgod.domain.valuation import FairValue
 from mindgod.domain.venues import ListingKey, VenueId
@@ -56,6 +66,49 @@ def outcome_key(outcome: Outcome) -> str:
     else:  # pragma: no cover - the domain only has these three conditions
         raise TypeError(f"unknown condition: {type(cond)}")
     return "|".join(parts)
+
+
+def parse_outcome_key(key: str) -> Outcome | None:
+    """Inverse of outcome_key: rebuild the Outcome a stored key was made from.
+
+    The Outcome constructor re-applies the current domain normalization, so
+    ``outcome_key(parse_outcome_key(k))`` is the canonical key under the
+    current rules. Keys stored under an older normalization (e.g. MLB
+    moneyline No sides as "margin <= 0" before the full-game no-tie rule)
+    come back re-normalized ("margin <= -1"). Returns None when the key
+    does not parse.
+    """
+    parts = key.split("|")
+    if len(parts) != 9:
+        return None
+    try:
+        quantity = Quantity(
+            league=League(parts[0]),
+            event_id=EventId(parts[1]),
+            stat=Stat(parts[2]),
+            period=Period(parts[3]),
+            team_id=TeamId(parts[4]) if parts[4] else None,
+            player_id=PlayerId(parts[5]) if parts[5] else None,
+        )
+    except ValueError:
+        return None
+    cond_kind = parts[6]
+    condition: Threshold | Band | CategoryIs
+    try:
+        if cond_kind == "threshold":
+            condition = Threshold(Comparator(parts[7]), Decimal(parts[8]))
+        elif cond_kind == "band":
+            condition = Band(Decimal(parts[7]), Decimal(parts[8]))
+        elif cond_kind == "category":
+            condition = CategoryIs(parts[7])
+        else:
+            return None
+    except (ValueError, InvalidOperation):
+        return None
+    try:
+        return Outcome(quantity=quantity, condition=condition)
+    except (ValueError, TypeError):
+        return None
 
 
 def terms_key(terms: Terms) -> str:

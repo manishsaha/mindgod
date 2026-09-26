@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Any
 
 from mindgod.application.calls import (
+    CLOSING_LINE_METHOD_VERSION,
     Call,
     CallGrade,
     CallSnapshot,
@@ -152,7 +153,30 @@ class Store(ObservationStore):
                  edge_half_life_s REAL,
                  graded_at TEXT NOT NULL)"""
         )
+        self._ensure_method_versioning()
         self._conn.commit()
+
+    def _ensure_method_versioning(self) -> None:
+        """Append-only versioning for closes, grades, and outcome-key remaps.
+
+        Existing rows predate versioning and keep method_version=1 via the
+        column default; new writes stamp the current version. Old rows are
+        never backfilled, overwritten, or deleted: the recompute migration
+        appends new-version rows and readers take the latest version.
+        """
+        for table in ("closing_lines", "call_grades"):
+            cols = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if "method_version" not in cols:
+                self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN method_version INTEGER NOT NULL DEFAULT 1"
+                )
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS outcome_key_remap(
+                 old_key TEXT PRIMARY KEY,
+                 new_key TEXT NOT NULL,
+                 reason TEXT NOT NULL,
+                 created_at TEXT NOT NULL)"""
+        )
 
     def _insert_observation(
         self,
@@ -335,12 +359,13 @@ class Store(ObservationStore):
         """ADR-0008: last sharp consensus before the event locks."""
         self._conn.execute(
             "INSERT INTO closing_lines (outcome_key, sharp_close_prob, source,"
-            " captured_at) VALUES (?, ?, ?, ?)",
+            " captured_at, method_version) VALUES (?, ?, ?, ?, ?)",
             (
                 line.outcome_key,
                 line.sharp_close_prob,
                 line.source,
                 line.captured_at.isoformat(),
+                line.method_version,
             ),
         )
         self._conn.commit()
@@ -366,10 +391,15 @@ class Store(ObservationStore):
         return [(r[0], r[1], r[2], r[3]) for r in rows]
 
     def has_closing_line(self, outcome_key: str) -> bool:
-        """Check if a closing line has already been captured for an outcome."""
+        """Check if a closing line was captured with the current method.
+
+        Version-aware: a v1 row does not count, otherwise the recompute
+        would see the old invalid rows and treat those outcomes as already
+        captured.
+        """
         row = self._conn.execute(
-            "SELECT 1 FROM closing_lines WHERE outcome_key = ? LIMIT 1",
-            (outcome_key,),
+            "SELECT 1 FROM closing_lines WHERE outcome_key = ? AND method_version = ? LIMIT 1",
+            (outcome_key, CLOSING_LINE_METHOD_VERSION),
         ).fetchone()
         return row is not None
 
@@ -388,8 +418,8 @@ class Store(ObservationStore):
         """ADR-0008: CLV/P&L/half-life for a call, after close and settlement."""
         self._conn.execute(
             "INSERT INTO call_grades (call_id, clv_reaction, clv_manual,"
-            " pnl_reaction, pnl_manual, edge_half_life_s, graded_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            " pnl_reaction, pnl_manual, edge_half_life_s, graded_at,"
+            " method_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 grade.call_id,
                 grade.clv_reaction,
@@ -398,16 +428,21 @@ class Store(ObservationStore):
                 grade.pnl_manual,
                 grade.edge_half_life_s,
                 grade.graded_at.isoformat(),
+                grade.method_version,
             ),
         )
         self._conn.commit()
 
     def get_call_grade(self, call_id: str) -> dict[str, Any] | None:
-        """Fetch the latest recorded grade for a call."""
+        """Fetch the latest-version recorded grade for a call.
+
+        "Latest" is the highest method_version present, so readers see v2
+        rows after the recompute and v1 rows before it, never a mix.
+        """
         row = self._conn.execute(
             "SELECT call_id, clv_reaction, clv_manual, pnl_reaction, pnl_manual,"
-            " edge_half_life_s, graded_at FROM call_grades"
-            " WHERE call_id = ? ORDER BY id DESC LIMIT 1",
+            " edge_half_life_s, graded_at, method_version FROM call_grades"
+            " WHERE call_id = ? ORDER BY method_version DESC, id DESC LIMIT 1",
             (call_id,),
         ).fetchone()
         if not row:
@@ -420,7 +455,48 @@ class Store(ObservationStore):
             "pnl_manual": row[4],
             "edge_half_life_s": row[5],
             "graded_at": row[6],
+            "method_version": row[7],
         }
+
+    def get_call_grade_version(self, call_id: str, method_version: int) -> dict[str, Any] | None:
+        """Fetch the recorded grade for a call at one method version."""
+        row = self._conn.execute(
+            "SELECT call_id, clv_reaction, clv_manual, pnl_reaction, pnl_manual,"
+            " edge_half_life_s, graded_at, method_version FROM call_grades"
+            " WHERE call_id = ? AND method_version = ?"
+            " ORDER BY id DESC LIMIT 1",
+            (call_id, method_version),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "call_id": row[0],
+            "clv_reaction": row[1],
+            "clv_manual": row[2],
+            "pnl_reaction": row[3],
+            "pnl_manual": row[4],
+            "edge_half_life_s": row[5],
+            "graded_at": row[6],
+            "method_version": row[7],
+        }
+
+    def all_calls(self) -> list[dict[str, Any]]:
+        """Every recorded call, oldest first (for the recompute migration)."""
+        rows = self._conn.execute(
+            "SELECT call_id, market_id, side, outcome, event_start, created_at"
+            " FROM calls ORDER BY created_at"
+        ).fetchall()
+        return [
+            {
+                "call_id": r[0],
+                "market_id": r[1],
+                "side": r[2],
+                "outcome": r[3],
+                "event_start": r[4],
+                "created_at": r[5],
+            }
+            for r in rows
+        ]
 
     def unsettled_calls(self) -> list[tuple[str, str, str, str]]:
         """Get calls that need settlement: (call_id, market_id, side, outcome_key).
@@ -527,10 +603,11 @@ class Store(ObservationStore):
         ]
 
     def get_closing_line(self, outcome_key: str) -> dict[str, Any] | None:
-        """Fetch the closing line for an outcome, if captured."""
+        """Fetch the latest-version closing line for an outcome, if captured."""
         row = self._conn.execute(
-            "SELECT outcome_key, sharp_close_prob, source, captured_at"
-            " FROM closing_lines WHERE outcome_key = ? LIMIT 1",
+            "SELECT outcome_key, sharp_close_prob, source, captured_at,"
+            " method_version FROM closing_lines WHERE outcome_key = ?"
+            " ORDER BY method_version DESC LIMIT 1",
             (outcome_key,),
         ).fetchone()
         if not row:
@@ -540,7 +617,76 @@ class Store(ObservationStore):
             "sharp_close_prob": row[1],
             "source": row[2],
             "captured_at": row[3],
+            "method_version": row[4],
         }
+
+    def get_closing_line_version(
+        self, outcome_key: str, method_version: int
+    ) -> dict[str, Any] | None:
+        """Fetch the closing line for an outcome at one method version."""
+        row = self._conn.execute(
+            "SELECT outcome_key, sharp_close_prob, source, captured_at,"
+            " method_version FROM closing_lines WHERE outcome_key = ?"
+            " AND method_version = ? LIMIT 1",
+            (outcome_key, method_version),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "outcome_key": row[0],
+            "sharp_close_prob": row[1],
+            "source": row[2],
+            "captured_at": row[3],
+            "method_version": row[4],
+        }
+
+    def record_key_remap(self, old_key: str, new_key: str, reason: str, at: datetime) -> None:
+        """Append an outcome-key remap (old normalization -> new).
+
+        Used by the recompute migration when a stored key was built under
+        an older domain normalization (e.g. MLB moneyline No sides stored
+        as "margin <= 0" before the full-game no-tie rule). Append-only and
+        idempotent: re-recording the same old key is a no-op.
+        """
+        self._conn.execute(
+            "INSERT OR IGNORE INTO outcome_key_remap"
+            " (old_key, new_key, reason, created_at) VALUES (?, ?, ?, ?)",
+            (old_key, new_key, reason, at.isoformat()),
+        )
+        self._conn.commit()
+
+    def canonical_outcome_key(self, outcome_key: str) -> str:
+        """Map a stored outcome key to its current normalization."""
+        row = self._conn.execute(
+            "SELECT new_key FROM outcome_key_remap WHERE old_key = ?",
+            (outcome_key,),
+        ).fetchone()
+        return row[0] if row else outcome_key
+
+    def settled_calls(self) -> list[dict[str, Any]]:
+        """Calls with a recorded settlement, oldest first.
+
+        One row per call; when several settlement rows share an outcome key
+        the earliest one wins (the result is the same for the outcome).
+        """
+        rows = self._conn.execute(
+            """SELECT c.call_id, c.market_id, c.side, c.outcome, c.event_start,
+                      MIN(s.result), MIN(s.settled_at)
+               FROM calls c JOIN settlements s ON s.outcome_key = c.outcome
+               GROUP BY c.call_id ORDER BY c.created_at"""
+        ).fetchall()
+        return [
+            {
+                "call_id": r[0],
+                "market_id": r[1],
+                "side": r[2],
+                "outcome": r[3],
+                "event_start": r[4],
+                "result": r[5],
+                "settled_at": r[6],
+            }
+            for r in rows
+        ]
 
     def as_of(self, key: str, ts: datetime) -> list[tuple[Any, ...]]:
         """Latest observation rows known at `ts` for one outcome key."""
