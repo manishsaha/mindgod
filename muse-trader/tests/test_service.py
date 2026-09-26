@@ -172,7 +172,7 @@ def test_no_fair_value_when_terms_differ():
     priced = [_feed_priced(outcome, _terms(outcome, None), -110)]
     book = _book(listing.key)
     ctx = _context(listing, event, [book], FakeModel({}))
-    opps = asyncio.new_event_loop().run_until_complete(tick(ctx, priced))
+    opps = asyncio.run(tick(ctx, priced))
     assert opps == []
     assert ctx.detector.seen == []
 
@@ -219,7 +219,7 @@ def test_matching_terms_flow_through():
     ctx = _context(
         listing, event, [_book(listing.key)], FakeModel({key: {outcome: fair}}), detector
     )
-    opps = asyncio.new_event_loop().run_until_complete(tick(ctx, priced))
+    opps = asyncio.run(tick(ctx, priced))
     assert len(opps) == 1
     assert opps[0].fair_value.probability.value == Decimal("0.5")
     assert detector.seen[0] == {outcome: fair}
@@ -323,7 +323,7 @@ def test_move_check_suppresses_move_away_from_fair():
     book = _two_sided_book(listing.key, "0.45", "0.43")
     ctx = _context(listing, event, [book], FakeModel(by_terms))
     ctx.mid_at_refresh[listing.key] = 0.50
-    opps = asyncio.new_event_loop().run_until_complete(tick(ctx, priced))
+    opps = asyncio.run(tick(ctx, priced))
     assert opps == []
     assert ctx.detector.seen == []
 
@@ -337,7 +337,7 @@ def test_move_check_allows_move_toward_fair():
     book = _two_sided_book(listing.key, "0.49", "0.47")
     ctx = _context(listing, event, [book], FakeModel(by_terms))
     ctx.mid_at_refresh[listing.key] = 0.44
-    asyncio.new_event_loop().run_until_complete(tick(ctx, priced))
+    asyncio.run(tick(ctx, priced))
     assert ctx.detector.seen != []
 
 
@@ -350,7 +350,7 @@ def test_move_check_skips_on_wide_spread():
     book = _two_sided_book(listing.key, "0.45", "0.35")
     ctx = _context(listing, event, [book], FakeModel(by_terms))
     ctx.mid_at_refresh[listing.key] = 0.50
-    asyncio.new_event_loop().run_until_complete(tick(ctx, priced))
+    asyncio.run(tick(ctx, priced))
     assert ctx.detector.seen != []
 
 
@@ -360,7 +360,7 @@ def test_small_move_does_not_suppress():
     book = _two_sided_book(listing.key, "0.49", "0.47")
     ctx = _context(listing, event, [book], FakeModel(by_terms))
     ctx.mid_at_refresh[listing.key] = 0.47
-    asyncio.new_event_loop().run_until_complete(tick(ctx, priced))
+    asyncio.run(tick(ctx, priced))
     assert ctx.detector.seen != []
 
 
@@ -369,7 +369,7 @@ def test_refresh_flag_snapshots_mids():
     priced, by_terms = _fair_for(listing, event)
     ctx = _context(listing, event, [_book_at(listing.key, "0.47")], FakeModel(by_terms))
     ctx.sportsbook_refreshed = True
-    asyncio.new_event_loop().run_until_complete(tick(ctx, priced))
+    asyncio.run(tick(ctx, priced))
     assert ctx.mid_at_refresh[listing.key] == 0.47
     assert ctx.sportsbook_refreshed is False
 
@@ -424,7 +424,7 @@ def test_notification_task_is_held_until_it_runs():
             await asyncio.sleep(0)
         return opps
 
-    opps = asyncio.new_event_loop().run_until_complete(_main())
+    opps = asyncio.run(_main())
     assert len(opps) == 1
     assert len(notifier.sent) == 1
     assert ctx.notify_tasks == set()

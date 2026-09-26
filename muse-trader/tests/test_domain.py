@@ -17,7 +17,7 @@ from mindgod.domain.propositions import (
     total,
 )
 from mindgod.domain.quotes import OrderBook, PriceLevel
-from mindgod.domain.sports import Event, EventId, League, PlayerId, TeamId
+from mindgod.domain.sports import Event, EventId, League, Period, PlayerId, TeamId
 from mindgod.domain.stats import Stat
 from mindgod.domain.terms import Payoff, Terms, TermsDifference, VoidPolicy, differences
 from mindgod.domain.valuation import FairValue
@@ -51,6 +51,19 @@ class TestCanonicalOutcomes:
 
     def test_moneyline_complement_includes_the_tie(self) -> None:
         assert moneyline(NFL_GAME, KC).complement() != moneyline(NFL_GAME, BUF)
+
+    def test_mlb_full_game_moneyline_complement_is_the_away_moneyline(self) -> None:
+        # MLB full games cannot end tied, so "margin <= 0" is "margin <= -1":
+        # the complement of "NYY wins" is exactly the book's "BOS wins".
+        # Without this, MLB moneyline closing lines never pair and go missing.
+        assert moneyline(MLB_NIGHTCAP, NYY).complement() == moneyline(MLB_NIGHTCAP, BOS)
+        assert moneyline(MLB_NIGHTCAP, BOS).complement() == moneyline(MLB_NIGHTCAP, NYY)
+
+    def test_mlb_first_five_can_tie_so_complement_keeps_zero(self) -> None:
+        # First-five innings can tie: no collapsing, unlike the full game.
+        assert moneyline(MLB_NIGHTCAP, NYY, Period.FIRST_FIVE_INNINGS).complement() != moneyline(
+            MLB_NIGHTCAP, BOS, Period.FIRST_FIVE_INNINGS
+        )
 
     def test_ladder_rungs_imply_lower_rungs(self) -> None:
         over_50_5 = total(NFL_GAME, Comparator.GT, D("50.5"))

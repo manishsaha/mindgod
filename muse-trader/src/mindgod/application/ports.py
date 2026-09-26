@@ -126,6 +126,24 @@ class FairValueModel(Protocol):
         self, priced: list[PricedOutcome], as_of: datetime
     ) -> dict[str, dict[Outcome, FairValue]]: ...
 
+    def consensus(self, pairs: list[tuple[str, float]]) -> float:
+        """Sharp-weighted average of (venue_id, probability) pairs.
+
+        The same consensus math the live fair values use, so closing lines
+        cannot drift apart from what the model priced live.
+        """
+        ...
+
+    @property
+    def devig_method(self) -> str:
+        """Vig-removal method ("power", "multiplicative", "additive")."""
+        ...
+
+    @property
+    def max_quote_age_s(self) -> float:
+        """Quotes confirmed longer ago than this are never used."""
+        ...
+
 
 class OpportunityDetector(Protocol):
     def detect(
@@ -151,10 +169,12 @@ class ObservationStore(Protocol):
     def record_closing_line(self, line: ClosingLine) -> None: ...
     def record_settlement(self, settlement: Settlement) -> None: ...
     def record_call_grade(self, grade: CallGrade) -> None: ...
-    # Closing line capture: query historical quotes
+    # Closing line capture: query historical quotes.
+    # Each entry: (venue, price, valid_at, recorded_at). recorded_at is the
+    # confirmation time; staleness gates on it per ADR-0007.
     def latest_quotes_before(
         self, outcome_key: str, before: datetime
-    ) -> list[tuple[str, float, str]]: ...
+    ) -> list[tuple[str, float, str, str]]: ...
     def has_closing_line(self, outcome_key: str) -> bool: ...
     # Settlement: get calls awaiting results
     def unsettled_calls(self) -> list[tuple[str, str, str, str]]: ...

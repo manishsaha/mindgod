@@ -347,11 +347,14 @@ class Store(ObservationStore):
 
     def latest_quotes_before(
         self, outcome_key: str, before: datetime
-    ) -> list[tuple[str, float, str]]:
+    ) -> list[tuple[str, float, str, str]]:
         """Get the latest quote per venue for an outcome with valid_at before the given time.
 
-        Returns list of (venue, price, valid_at) tuples. Used for closing-line
-        capture: the last pre-game consensus, not in-game prices.
+        Returns list of (venue, price, valid_at, recorded_at) tuples. Used for closing-line
+        capture: the last pre-game consensus, not in-game prices. recorded_at is the
+        confirmation time (when we last saw the quote); per ADR-0007, staleness is
+        gated on confirmation age, not on when the price last moved, so a line
+        that holds steady before kickoff is still fresh.
         """
         rows = self._conn.execute(
             """SELECT venue, price, valid_at, MAX(recorded_at)
@@ -360,7 +363,7 @@ class Store(ObservationStore):
                GROUP BY venue""",
             (outcome_key, before.isoformat()),
         ).fetchall()
-        return [(r[0], r[1], r[2]) for r in rows]
+        return [(r[0], r[1], r[2], r[3]) for r in rows]
 
     def has_closing_line(self, outcome_key: str) -> bool:
         """Check if a closing line has already been captured for an outcome."""
@@ -398,6 +401,26 @@ class Store(ObservationStore):
             ),
         )
         self._conn.commit()
+
+    def get_call_grade(self, call_id: str) -> dict[str, Any] | None:
+        """Fetch the latest recorded grade for a call."""
+        row = self._conn.execute(
+            "SELECT call_id, clv_reaction, clv_manual, pnl_reaction, pnl_manual,"
+            " edge_half_life_s, graded_at FROM call_grades"
+            " WHERE call_id = ? ORDER BY id DESC LIMIT 1",
+            (call_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "call_id": row[0],
+            "clv_reaction": row[1],
+            "clv_manual": row[2],
+            "pnl_reaction": row[3],
+            "pnl_manual": row[4],
+            "edge_half_life_s": row[5],
+            "graded_at": row[6],
+        }
 
     def unsettled_calls(self) -> list[tuple[str, str, str, str]]:
         """Get calls that need settlement: (call_id, market_id, side, outcome_key).

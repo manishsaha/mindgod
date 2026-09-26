@@ -556,15 +556,17 @@ def capture_closing_lines(
     """ADR-0008: record the last sharp consensus before events lock.
 
     For each listing, pairs the outcome with its exact complement per venue,
-    devigs each pair (removing the vig), and takes a sharp-weighted average.
-    This produces a true fair-value closing line, not a vig-included average.
+    devigs each pair (removing the vig), and takes a sharp-weighted consensus
+    through the model port (the same math the live fair values use).
 
     The pairing fails closed:
     - Whole-number lines (e.g., KC -3) don't pair with the other side's
       whole-number line (BUF +3 is "margin <= 2", not the complement of
       "margin >= 4"), so those venues are skipped.
     - Lone sides (only one side quoted) are skipped, not passed through.
-    - Stale quotes (older than max_quote_age_s) are ignored.
+    - Stale quotes are ignored, gated on confirmation age (recorded_at, per
+      ADR-0007): a line that holds steady before kickoff is still fresh as
+      long as the feed kept confirming it.
 
     Each side is looked up under its own key, so there's nothing to flip:
     Yes and No listings get their own devigged probabilities directly.
@@ -576,12 +578,9 @@ def capture_closing_lines(
     from .pricing import devig, outcome_key
 
     n = 0
-    # Get model parameters for devig and weighting
     model = ctx.model
-    method = getattr(model, "_method", "power")
-    book_weights = getattr(model, "_book_weights", {})
-    default_weight = getattr(model, "_default_weight", 1.0)
-    max_age_s = getattr(model, "_max_quote_age_s", 900.0)
+    method = model.devig_method
+    max_age_s = model.max_quote_age_s
 
     for listings in [ctx.resolver.listings_for(ex.venue_id) for ex in ctx.exchanges]:
         for listing in listings:
@@ -605,29 +604,32 @@ def capture_closing_lines(
                 continue
             comp_key = outcome_key(comp)
 
-            # Get latest quotes for both sides before event start
+            # Get latest quotes for both sides before event start.
+            # Each entry is (venue, price, valid_at, recorded_at).
             own_quotes = ctx.store.latest_quotes_before(okey, start)
             comp_quotes = ctx.store.latest_quotes_before(comp_key, start)
 
-            # Index by venue: {venue: (price, valid_at)}
-            mine = {v: (p, va) for v, p, va in own_quotes}
-            theirs = {v: (p, va) for v, p, va in comp_quotes}
+            # Index by venue: {venue: (price, recorded_at)}
+            mine = {v: (p, ra) for v, p, _, ra in own_quotes}
+            theirs = {v: (p, ra) for v, p, _, ra in comp_quotes}
 
-            # Pair by venue, devig each pair, weight by sharp weights
-            pairs = []  # list of (devigged_prob, weight)
+            # Pair by venue and devig each pair. Staleness is gated on
+            # confirmation age (recorded_at, per ADR-0007): a line that holds
+            # steady before kickoff is still fresh as long as the feed kept
+            # confirming it. If the feed died before kickoff, "the latest
+            # quote before start" is not a closing line.
+            venue_probs = []  # list of (venue, devigged_prob)
             for venue in mine.keys() & theirs.keys():
-                p_own, va_own = mine[venue]
-                p_comp, va_comp = theirs[venue]
+                p_own, ra_own = mine[venue]
+                p_comp, ra_comp = theirs[venue]
 
-                # Ignore stale quotes: if the feed died before kickoff,
-                # "latest before start" is not a closing line
                 try:
-                    va_own_dt = datetime.fromisoformat(va_own)
-                    va_comp_dt = datetime.fromisoformat(va_comp)
+                    ra_own_dt = datetime.fromisoformat(ra_own)
+                    ra_comp_dt = datetime.fromisoformat(ra_comp)
                 except (ValueError, TypeError):
                     continue
-                age_own = (start - va_own_dt).total_seconds()
-                age_comp = (start - va_comp_dt).total_seconds()
+                age_own = (start - ra_own_dt).total_seconds()
+                age_comp = (start - ra_comp_dt).total_seconds()
                 if age_own > max_age_s or age_comp > max_age_s:
                     continue
 
@@ -637,20 +639,17 @@ def capture_closing_lines(
                 except (ValueError, ZeroDivisionError):
                     continue
                 # devig returns [prob_own, prob_comp]; we want prob_own
-                prob = devigged[0]
+                venue_probs.append((venue, devigged[0]))
 
-                # Weight by sharp weights
-                weight = book_weights.get(venue, default_weight)
-                pairs.append((prob, weight))
-
-            if not pairs:
+            if not venue_probs:
                 continue
 
-            # Weighted average
-            total_w = sum(w for _, w in pairs)
-            if total_w <= 0:
+            # Sharp-weighted consensus through the model port: the same math
+            # the live fair values use, so the two cannot drift apart.
+            try:
+                prob = model.consensus(venue_probs)
+            except ValueError:
                 continue
-            prob = sum(p * w for p, w in pairs) / total_w
 
             try:
                 ctx.store.record_closing_line(

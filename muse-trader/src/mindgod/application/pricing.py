@@ -251,6 +251,23 @@ class WeightedConsensusModel:
     def _weight(self, venue_id: VenueId) -> float:
         return self._book_weights.get(str(venue_id), self._default_weight)
 
+    def consensus(self, pairs: list[tuple[str, float]]) -> float:
+        """Sharp-weighted average of (venue_id, probability) pairs.
+
+        Public so closing-line capture uses the exact consensus the live
+        fair values use, instead of duplicating the math (and the weights)
+        behind private-field access that silently degrades on refactor.
+        """
+        return consensus([(p, self._book_weights.get(v, self._default_weight)) for v, p in pairs])
+
+    @property
+    def devig_method(self) -> str:
+        return self._method
+
+    @property
+    def max_quote_age_s(self) -> float:
+        return self._max_quote_age_s
+
     def values_by_terms(
         self, priced: list[PricedOutcome], as_of: datetime
     ) -> dict[str, dict[Outcome, FairValue]]:
@@ -273,7 +290,9 @@ class WeightedConsensusModel:
                 by_outcome[d.outcome].append(d)
             fair_values: dict[Outcome, FairValue] = {}
             for outcome, entries in by_outcome.items():
-                prob = consensus([(e.fair_probability, e.weight) for e in entries])
+                prob = self.consensus(
+                    [(str(e.listing_key.venue_id), e.fair_probability) for e in entries]
+                )
                 base = max(
                     _weighted_std([(e.fair_probability, e.weight) for e in entries], prob),
                     self._min_standard_error,

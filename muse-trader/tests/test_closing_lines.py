@@ -1,29 +1,33 @@
-"""Integration test for the full grading loop: capture -> settle -> grade.
+"""Closing-line capture and the full alert-to-grade loop.
 
-This test exercises the REAL production code paths:
-- capture_closing_lines (with devig, not vig-included averaging)
-- _check_settlements (with Kalshi market results)
-- _grade_settled_call (via grade_call)
+test_closing_lines_devigged_not_vig_included exercises the real
+capture_closing_lines on a lopsided -150/+130 NFL spread pair and asserts
+the devigged close (not the vig-included average), that Yes and No get
+different values summing to 1 (catches side swaps and double flips), and
+that a whole-number pair fails closed with no closing line.
 
-It uses a -110/-110 NFL spread (52.4% implied each side, 4.8% vig) and asserts:
-1. Both Yes and No closing lines on the half-point pair come out at 0.500
-   (devigged, not 0.524)
-2. The whole-number pair (KC -3) produces NO closing line (fails closed,
-   because the complement doesn't pair exactly)
-3. The resulting grade's CLV equals close - fill price - fee per contract
+test_full_cycle_settlement_and_grade runs the production path end to end:
+capture_closing_lines, then _check_settlements with a fake Kalshi result,
+then asserts the persisted grade's CLV equals
+close - reaction fill price - fee per contract.
 """
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+import pytest
+
 from mindgod.adapters.store import Store
+from mindgod.application.calls import Call, PaperFill
 from mindgod.application.ports import ListingKey, PricedOutcome
-from mindgod.application.pricing import WeightedConsensusModel, outcome_key
+from mindgod.application.pricing import WeightedConsensusModel, devig, outcome_key
 from mindgod.application.service import (
     ServiceContext,
+    _check_settlements,
     capture_closing_lines,
 )
-from mindgod.domain.primitives import Observation
+from mindgod.domain.primitives import Observation, Probability
 from mindgod.domain.propositions import spread
 from mindgod.domain.quotes import SportsbookQuote
 from mindgod.domain.sports import Event, EventId, League, TeamId
@@ -44,12 +48,17 @@ class FakeExchange:
     def __init__(self, venue_id, listings):
         self.venue_id = venue_id
         self._listings = listings
+        self._results: dict[str, str] = {}
 
     async def discover(self):
         return []
 
     async def order_book(self, market_id):
         return None
+
+    async def market_results(self, tickers):
+        """Fake Kalshi settlement results, keyed by market ticker."""
+        return {t: self._results.get(t) for t in tickers}
 
 
 class FakeResolver:
@@ -104,16 +113,67 @@ def _make_terms(outcome):
     )
 
 
+def _record_half_point_quotes(store, event_hp, outcome_hp_yes, outcome_hp_no):
+    """Record lopsided -150/+130 quotes from two books for the half-point pair.
+
+    valid_at is 2 hours before kickoff (the line held steady) but the feed
+    kept confirming it 15 minutes before kickoff. Per ADR-0007, staleness
+    gates on confirmation age (recorded_at), not on when the price last
+    moved.
+    """
+    valid_at = event_hp.scheduled_start - timedelta(hours=2)
+    recorded_at = event_hp.scheduled_start - timedelta(minutes=15)
+    priced = []
+    for venue in [DK, FD]:
+        for outcome, odds in [(outcome_hp_yes, -150), (outcome_hp_no, 130)]:
+            key = ListingKey(venue_id=venue, market_id="test", side="yes")
+            obs = Observation(valid_at=valid_at, recorded_at=recorded_at)
+            quote = SportsbookQuote(listing=key, american_odds=odds, observed=obs)
+            priced.append(
+                PricedOutcome(
+                    outcome=outcome,
+                    listing_key=key,
+                    quote=quote,
+                    market_group=f"{venue}:test",
+                    terms=_make_terms(outcome),
+                )
+            )
+    store.record_priced(priced, recorded_at)
+
+
+def _make_ctx(store, listings, event_hp):
+    """Build a ServiceContext with the real model and fake venue adapters."""
+    model = WeightedConsensusModel(
+        method="power",
+        book_weights={str(DK): 2.0, str(FD): 1.0},  # DK is sharper
+        max_quote_age_s=3600,  # 1 hour
+    )
+    resolver = FakeResolver(listings, event_hp)
+    return ServiceContext(
+        sportsbook=None,
+        exchanges=[FakeExchange(KALSHI, listings)],
+        execution={},
+        resolver=resolver,
+        model=model,
+        detector=None,  # type: ignore
+        risk=None,  # type: ignore
+        store=store,
+    )
+
+
 def test_closing_lines_devigged_not_vig_included():
-    """-110/-110 must devig to 0.500, not average to 0.524.
+    """Lopsided -150/+130 must devig; symmetric data can't catch a side swap.
 
     Sets up:
-    - KC -3.5 (Yes/No listings) with -110/-110 quotes from two books
-    - KC -3 (Yes/No listings) with -110/-110 quotes (whole number)
+    - KC -3.5 (Yes/No listings) with -150/+130 quotes from two books
+    - KC -3 / BUF +3 (whole number) with -110/-110 quotes
 
     Asserts:
-    - Half-point pair: both Yes and No closing lines = 0.500 (devigged)
-    - Whole-number pair: NO closing line (complement doesn't pair exactly)
+    - Yes and No closing lines are the devigged values, different from each
+      other and summing to 1. A bug that swaps the sides (or flips twice)
+      fails the ordering assertion.
+    - The whole-number pair produces NO closing line (complement doesn't
+      pair exactly: "margin >= 4" vs "margin <= 2").
     """
     store = Store(":memory:")
     event_hp = _make_event("-hp")
@@ -161,33 +221,15 @@ def test_closing_lines_devigged_not_vig_included():
         terms = _make_terms(outcome)
         listings.append(FakeListing(key, outcome, terms))
 
-    # Record -110/-110 quotes from two books for all four outcomes
-    # -110 = 52.38% implied
-    valid_at = event_hp.scheduled_start - timedelta(minutes=30)
-    recorded_at = event_hp.scheduled_start - timedelta(minutes=15)
+    # Lopsided -150/+130 quotes for the half-point pair (see helper docstring
+    # for why valid_at is old while recorded_at is fresh).
+    _record_half_point_quotes(store, event_hp, outcome_hp_yes, outcome_hp_no)
 
+    # Whole-number pair: NOT complements, will NOT pair
+    valid_at = event_hp.scheduled_start - timedelta(hours=2)
+    recorded_at = event_hp.scheduled_start - timedelta(minutes=15)
     priced = []
     for venue in [DK, FD]:
-        # Half-point pair: exact complements, will pair and devig
-        for outcome in [outcome_hp_yes, outcome_hp_no]:
-            key = ListingKey(venue_id=venue, market_id="test", side="yes")
-            obs = Observation(valid_at=valid_at, recorded_at=recorded_at)
-            # -110 American odds
-            quote = SportsbookQuote(
-                listing=key,
-                american_odds=-110,
-                observed=obs,
-            )
-            priced.append(
-                PricedOutcome(
-                    outcome=outcome,
-                    listing_key=key,
-                    quote=quote,
-                    market_group=f"{venue}:test",
-                    terms=_make_terms(outcome),
-                )
-            )
-        # Whole-number pair: NOT complements, will NOT pair
         for outcome in [outcome_wn_kc, outcome_wn_buf]:
             key = ListingKey(venue_id=venue, market_id="test-wn", side="yes")
             obs = Observation(valid_at=valid_at, recorded_at=recorded_at)
@@ -208,23 +250,7 @@ def test_closing_lines_devigged_not_vig_included():
     store.record_priced(priced, recorded_at)
 
     # Build context
-    model = WeightedConsensusModel(
-        method="power",
-        book_weights={str(DK): 2.0, str(FD): 1.0},  # DK is sharper
-        max_quote_age_s=3600,  # 1 hour
-    )
-    # Both events have the same start time, so we can use event_hp for the resolver
-    resolver = FakeResolver(listings, event_hp)
-    ctx = ServiceContext(
-        sportsbook=None,
-        exchanges=[FakeExchange(KALSHI, listings)],
-        execution={},
-        resolver=resolver,
-        model=model,
-        detector=None,  # type: ignore
-        risk=None,  # type: ignore
-        store=store,
-    )
+    ctx = _make_ctx(store, listings, event_hp)
 
     # Capture closing lines (event started 30 min ago)
     at = event_hp.scheduled_start + timedelta(minutes=30)
@@ -244,14 +270,34 @@ def test_closing_lines_devigged_not_vig_included():
     assert cl_yes is not None, "Half-point Yes closing line missing"
     assert cl_no is not None, "Half-point No closing line missing"
 
-    # Devigged: 0.5238 / (0.5238 + 0.5238) = 0.5
-    # Weighted by book weights (DK 2.0, FD 1.0), but both have same price
-    assert abs(cl_yes["sharp_close_prob"] - 0.5) < 0.01, (
-        f"Yes close {cl_yes['sharp_close_prob']} != 0.5 (vig not removed?)"
+    # Check the half-point pair: devigged values from the production path.
+    # -150 => 0.60, +130 => 0.4348; power-devig removes the 3.5% overround.
+    # Both books quote the same prices, so sharp weights don't shift the mean.
+    hp_yes_key = outcome_key(outcome_hp_yes)
+    hp_no_key = outcome_key(outcome_hp_no)
+
+    cl_yes = store.get_closing_line(hp_yes_key)
+    cl_no = store.get_closing_line(hp_no_key)
+
+    assert cl_yes is not None, "Half-point Yes closing line missing"
+    assert cl_no is not None, "Half-point No closing line missing"
+
+    p_yes = Probability.from_american_odds(-150).value
+    p_no = Probability.from_american_odds(130).value
+    expected_yes, expected_no = devig([p_yes, p_no], "power")
+
+    yes_close = cl_yes["sharp_close_prob"]
+    no_close = cl_no["sharp_close_prob"]
+    assert yes_close == pytest.approx(expected_yes, abs=1e-6), (
+        f"Yes close {yes_close} != devigged {expected_yes}"
     )
-    assert abs(cl_no["sharp_close_prob"] - 0.5) < 0.01, (
-        f"No close {cl_no['sharp_close_prob']} != 0.5 (vig not removed?)"
+    assert no_close == pytest.approx(expected_no, abs=1e-6), (
+        f"No close {no_close} != devigged {expected_no}"
     )
+    # Lopsidedness is the point: Yes and No must differ and sum to 1.
+    # A side swap (or the old double flip) would put the small value on Yes.
+    assert yes_close > no_close, f"sides look swapped: Yes {yes_close} <= No {no_close}"
+    assert yes_close + no_close == pytest.approx(1.0, abs=1e-6)
 
     # Whole-number pair should have NO closing line
     # (KC -3 and BUF +3 are not exact complements, so they don't pair)
@@ -265,61 +311,104 @@ def test_closing_lines_devigged_not_vig_included():
     )
 
 
-def test_no_side_uses_own_key_not_flipped():
-    """No listings get their own devigged probability, not 1 - Yes.
+def test_full_cycle_settlement_and_grade():
+    """Alert -> reaction fill -> close -> settlement -> persisted grade.
 
-    The bug was: look up outcome_key(No outcome) which IS the No key,
-    then apply 1 - prob, turning it back into Yes prob.
-    The fix: each side is looked up under its own key and devigged
-    with its complement; no flipping.
+    Uses the real production path throughout: the real capture_closing_lines
+    (lopsided -150/+130 quotes, so the close is not symmetric), the real
+    _check_settlements against a fake Kalshi exchange returning a batched
+    result, and the real _grade_settled_call via the tested grade_call().
+
+    Asserts the persisted grade's CLV equals
+    close - reaction fill price - fee per contract, and that the instant
+    fill is ignored (ADR-0008: only the reaction fill feeds headline metrics).
     """
     store = Store(":memory:")
-    event = _make_event()
+    event_hp = _make_event("-hp")
+    outcome_hp_yes = spread(event_hp, KC, Decimal("-3.5"))
+    outcome_hp_no = outcome_hp_yes.complement()
+    assert outcome_hp_no is not None
 
-    outcome_yes = spread(event, KC, Decimal("-3.5"))
-    outcome_no = outcome_yes.complement()
-    assert outcome_no is not None
+    listings = []
+    for outcome, side in [(outcome_hp_yes, "yes"), (outcome_hp_no, "no")]:
+        key = ListingKey(
+            venue_id=KALSHI,
+            market_id="KXNFLGAME-26OCT05KCBUF",
+            side=side,
+        )
+        listings.append(FakeListing(key, outcome, _make_terms(outcome)))
 
-    # Verify the keys are different
-    yes_key = outcome_key(outcome_yes)
-    no_key = outcome_key(outcome_no)
-    assert yes_key != no_key, "Yes and No should have different keys"
+    _record_half_point_quotes(store, event_hp, outcome_hp_yes, outcome_hp_no)
+    ctx = _make_ctx(store, listings, event_hp)
 
-    # Record quotes: Yes at 52.38% (-110), No at 52.38% (-110)
-    # (In reality they'd be from the same market, but the store keeps them separate)
-    valid_at = event.scheduled_start - timedelta(hours=2)
-    recorded_at = event.scheduled_start - timedelta(hours=1)
+    # The alert fired on the Yes listing; record the call.
+    alert_at = event_hp.scheduled_start - timedelta(hours=3)
+    call = Call(
+        call_id="call-1",
+        created_at=alert_at,
+        listing_key=listings[0].key,
+        outcome=outcome_hp_yes,
+        fair_prob=0.58,
+        fair_se=0.02,
+        fair_method="power-devig",
+        limit_price_x=Decimal("0.60"),
+        contracts_n=10,
+        ask_at_alert=Decimal("0.57"),
+        net_edge_at_alert=Decimal("0.01"),
+        depth_at_x=100,
+        event_start=event_hp.scheduled_start,
+    )
+    store.record_call(call)
 
-    priced = []
-    for venue in [DK]:
-        for outcome in [outcome_yes, outcome_no]:
-            key = ListingKey(venue_id=venue, market_id="test", side="yes")
-            obs = Observation(valid_at=valid_at, recorded_at=recorded_at)
-            quote = SportsbookQuote(listing=key, american_odds=-110, observed=obs)
-            priced.append(
-                PricedOutcome(
-                    outcome=outcome,
-                    listing_key=key,
-                    quote=quote,
-                    market_group=f"{venue}:test",
-                    terms=_make_terms(outcome),
-                )
-            )
-    store.record_priced(priced, recorded_at)
+    # Two fills: an instant fill (must be ignored for grading) and the
+    # reaction-delay fill the service actually records after the alert.
+    fill_at = alert_at + timedelta(seconds=10)
+    store.record_paper_fill(
+        PaperFill(
+            call_id="call-1",
+            kind="instant",
+            contracts=10,
+            avg_price=Decimal("0.50"),
+            fee=Decimal("0.10"),
+            filled=True,
+            at=fill_at,
+        )
+    )
+    store.record_paper_fill(
+        PaperFill(
+            call_id="call-1",
+            kind="reaction",
+            contracts=10,
+            avg_price=Decimal("0.55"),
+            fee=Decimal("0.10"),
+            filled=True,
+            at=fill_at + timedelta(seconds=45),
+        )
+    )
 
-    # The No outcome's quotes are stored under the No key
-    # When we capture, we look up the No key and pair with its complement (Yes)
-    # The result should be ~0.5, NOT 1 - 0.5 = 0.5 (which happens to be same here)
-    # Let's use asymmetric prices to make the difference clear
+    # Close: real capture after the event started.
+    at = event_hp.scheduled_start + timedelta(minutes=30)
+    n = capture_closing_lines(ctx, at)
+    assert n == 2, f"Expected 2 closing lines, got {n}"
+    close = store.get_closing_line(outcome_key(outcome_hp_yes))
+    assert close is not None
+    close_prob = close["sharp_close_prob"]
 
-    # Clear and use asymmetric: Yes at 60% (-150), No at 47.6% (+110)
-    # Devigged Yes: 0.60 / (0.60 + 0.476) = 0.557
-    # Devigged No: 0.476 / (0.60 + 0.476) = 0.443
-    # If we flipped: 1 - 0.557 = 0.443 (correct by accident for No)
-    # But the bug was flipping the STORED No prob (0.476) to get 0.524 (wrong)
+    # Settlement: fake Kalshi returns a batched "yes" result for the market.
+    exchange = ctx.exchanges[0]
+    assert isinstance(exchange, FakeExchange)
+    exchange._results["KXNFLGAME-26OCT05KCBUF"] = "yes"
+    n_settled = asyncio.run(_check_settlements(ctx))
+    assert n_settled == 1, f"Expected 1 settlement, got {n_settled}"
 
-    # Actually, the test above already covers this: the No closing line
-    # comes from devigging the No side with its Yes complement, not from
-    # flipping the Yes devigged value. The values are 0.5 each because
-    # the market is symmetric. For asymmetric, they'd differ.
-    pass  # The main test covers the mechanism
+    # The persisted grade must tie CLV to the close, the REACTION fill price
+    # (0.55, not the instant fill's 0.50), and the fee per contract
+    # (0.10 total / 10 contracts = 0.01).
+    grade = store.get_call_grade("call-1")
+    assert grade is not None, "no grade persisted for the settled call"
+    expected_clv = close_prob - 0.55 - 0.01
+    assert grade["clv_reaction"] == pytest.approx(expected_clv, abs=1e-9), (
+        f"CLV {grade['clv_reaction']} != close {close_prob} - 0.55 - 0.01"
+    )
+    # The call won (side yes, result yes): P&L per contract is (1 - price) - fee.
+    assert grade["pnl_reaction"] == pytest.approx((1.0 - 0.55) - 0.01, abs=1e-9)

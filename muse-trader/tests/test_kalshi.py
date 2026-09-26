@@ -118,7 +118,7 @@ def test_batch_params_use_repeated_tickers():
     exchange = kalshi.KalshiExchange()
     import asyncio
 
-    asyncio.new_event_loop().run_until_complete(
+    asyncio.run(
         exchange._batch_books(FakeClient(), ["A", "B"])  # noqa: SLF001
     )
     assert seen["path"] == "/markets/orderbooks"
@@ -149,7 +149,7 @@ def test_discovery_filters_by_series(monkeypatch):
     exchange = kalshi.KalshiExchange(series_tickers=("KXNFLGAME", "KXMLBGAME"))
     import asyncio
 
-    out = asyncio.new_event_loop().run_until_complete(exchange.discover())
+    out = asyncio.run(exchange.discover())
     assert seen == [
         ("/markets", {"limit": 200, "series_ticker": "KXNFLGAME"}),
         ("/markets", {"limit": 200, "series_ticker": "KXMLBGAME"}),

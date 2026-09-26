@@ -199,7 +199,7 @@ class Outcome:
         if isinstance(self.condition, CategoryIs):
             raise ValueError(f"{self.quantity.stat} is numeric")
         # Canonicalise once, at construction, so equality means "same outcome".
-        object.__setattr__(self, "condition", _integer_normal_form(self.condition))
+        object.__setattr__(self, "condition", _integer_normal_form(self.quantity, self.condition))
 
     def complement(self) -> Outcome | None:
         """The outcome that happens exactly when this one does not, if it is one condition."""
@@ -218,7 +218,7 @@ class Outcome:
         return other.condition.as_interval().includes(self.condition.as_interval())
 
 
-def _integer_normal_form(condition: NumericCondition) -> NumericCondition:
+def _integer_normal_form(quantity: Quantity, condition: NumericCondition) -> NumericCondition:
     """Rewrite a condition on an integer-valued stat into its unique canonical form."""
     interval = condition.as_interval()
     lower = None if interval.lower is None else _smallest_int(interval.lower, interval.lower_closed)
@@ -226,14 +226,45 @@ def _integer_normal_form(condition: NumericCondition) -> NumericCondition:
     if upper is None:
         if lower is None:
             raise ValueError("condition is always true")
-        return Threshold(Comparator.GTE, lower)
-    if lower is None:
-        return Threshold(Comparator.LTE, upper)
-    if lower > upper:
+        result: NumericCondition = Threshold(Comparator.GTE, lower)
+    elif lower is None:
+        result = Threshold(Comparator.LTE, upper)
+    elif lower > upper:
         raise ValueError(f"no integer satisfies {condition}")
-    if lower == upper:
-        return Threshold(Comparator.EQ, lower)
-    return Band(lower, upper)
+    elif lower == upper:
+        result = Threshold(Comparator.EQ, lower)
+    else:
+        result = Band(lower, upper)
+    return _no_tie_normal_form(quantity, result)
+
+
+def _no_tie_normal_form(quantity: Quantity, condition: NumericCondition) -> NumericCondition:
+    """Exclude margin 0 where it is impossible: MLB full games cannot end tied.
+
+    Without this, the complement of "NYY wins" ("home margin >= 1") is
+    "home margin <= 0", but the book's "BOS wins" is stored as
+    "home margin <= -1". The canonical forms differ, the pair never forms,
+    and MLB moneyline closing lines silently go missing. Live pricing is
+    unaffected (it derives No from Yes); only complement-based pairing breaks.
+
+    Not applied to FIRST_FIVE_INNINGS or FIRST_INNING, which can tie, nor to
+    the NFL, where ties are possible.
+    """
+    if (
+        quantity.league != League.MLB
+        or quantity.period != Period.FULL_GAME
+        or quantity.stat != Stat.MARGIN
+        or not isinstance(condition, Threshold)
+        or condition.line != 0
+    ):
+        return condition
+    if condition.comparator == Comparator.LTE:
+        return Threshold(Comparator.LTE, Decimal(-1))
+    if condition.comparator == Comparator.GTE:
+        return Threshold(Comparator.GTE, Decimal(1))
+    if condition.comparator == Comparator.EQ:
+        raise ValueError("margin 0 is impossible in an MLB full game")
+    return condition
 
 
 def _smallest_int(bound: Decimal, closed: bool) -> Decimal:
