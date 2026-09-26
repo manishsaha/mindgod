@@ -580,3 +580,55 @@ def test_capture_skips_events_that_have_not_started():
     ctx = _make_ctx(store, listings, event)
     assert capture_closing_lines(ctx, event.scheduled_start - timedelta(hours=1)) == 0
     assert store.get_closing_line(outcome_key(outcome_yes)) is None
+
+
+def test_failed_close_marked_terminal_after_settlement():
+    """A settled call whose close can never compute stops being retried.
+
+    No quotes are ever recorded, so _close_for_outcome fails with
+    "no_quotes" every loop. Before settlement the capture keeps retrying
+    (quotes can arrive late, e.g. after a restart during the first hour);
+    once the call settles, the outcome is marked terminally unavailable and
+    later passes skip it instead of retrying forever.
+    """
+    store = Store(":memory:")
+    event_hp = _make_event()
+    outcome_hp_yes = spread(event_hp, KC, Decimal("-3.5"))
+    key = ListingKey(venue_id=KALSHI, market_id="KXNFLGAME-26OCT05KCBUF", side="yes")
+    listings = [FakeListing(key, outcome_hp_yes, _make_terms(outcome_hp_yes))]
+    ctx = _make_ctx(store, listings, event_hp)
+    okey = outcome_key(outcome_hp_yes)
+    assert not store.closing_line_terminal(okey)
+
+    at = event_hp.scheduled_start + timedelta(minutes=30)
+    # No quotes: no close, but the call is not settled, so retry continues.
+    assert capture_closing_lines(ctx, at) == 0
+    assert not store.closing_line_terminal(okey)
+
+    # Settle the call. The next pass marks the close terminal.
+    alert_at = event_hp.scheduled_start - timedelta(hours=3)
+    store.record_call(
+        Call(
+            call_id="call-1",
+            created_at=alert_at,
+            listing_key=key,
+            outcome=outcome_hp_yes,
+            fair_prob=0.58,
+            fair_se=0.02,
+            fair_method="power-devig",
+            limit_price_x=Decimal("0.60"),
+            contracts_n=10,
+            ask_at_alert=Decimal("0.57"),
+            net_edge_at_alert=Decimal("0.01"),
+            depth_at_x=100,
+            event_start=event_hp.scheduled_start,
+        )
+    )
+    store.record_settlement(Settlement(outcome_key=okey, result="win", settled_at=at))
+    assert capture_closing_lines(ctx, at) == 0
+    assert store.closing_line_terminal(okey)
+    assert not store.has_closing_line(okey)
+
+    # Later loops skip it: still terminal, still no close, no error.
+    assert capture_closing_lines(ctx, at + timedelta(minutes=5)) == 0
+    assert store.closing_line_terminal(okey)

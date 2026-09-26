@@ -39,8 +39,6 @@ from mindgod.domain.terms import Terms
 from mindgod.domain.valuation import FairValue
 from mindgod.domain.venues import Listing
 
-from .pricing import parse_terms_key
-
 log = logging.getLogger("mindgod.tie")
 
 # ADR-0011: conservative estimate of the modern-overtime NFL tie rate,
@@ -126,7 +124,7 @@ def tie_close_basis(listing: Listing) -> Outcome | None:
 
 
 def find_tie_adjusted_fair(
-    fair_by_terms: dict[str, dict[Outcome, FairValue]],
+    fair_by_terms: dict[str, tuple[Terms, dict[Outcome, FairValue]]],
     *,
     yes_outcome: Outcome,
     listing_terms: Terms,
@@ -140,6 +138,9 @@ def find_tie_adjusted_fair(
     policy, and converts its yes-basis fair value: P(win) = P_book(win) *
     (1 - t), with the tie-rate uncertainty added to the SE in quadrature.
 
+    The partition's Terms come through from values_by_terms directly; the
+    old parse_terms_key round trip is gone.
+
     Returns None when the rule does not apply (wrong league/period/stat,
     the listing itself refunds ties, not a moneyline shape) or when no
     tie-refunding partition carries the yes outcome.
@@ -152,13 +153,10 @@ def find_tie_adjusted_fair(
     if yes_basis(yes_outcome) != yes_outcome:
         return None
     tie_outcome = Outcome(yes_outcome.quantity, Threshold(Comparator.EQ, _TIE_LINE))
-    for partition_key, by_outcome in fair_by_terms.items():
-        parsed = parse_terms_key(partition_key)
-        if parsed is None:
+    for _partition_key, (terms, by_outcome) in fair_by_terms.items():
+        if terms.payoff.refunds_if != tie_outcome:
             continue
-        refunds, void = parsed
-        if refunds != tie_outcome:
-            continue
+        void = terms.void_policy
         policy = listing_terms.void_policy
         if (
             void.on_player_absent != policy.on_player_absent

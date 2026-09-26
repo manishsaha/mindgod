@@ -5,13 +5,18 @@
 
 polling:
   exchange_interval_s: 60
-  # 600s: the Odds API charges 1 credit per market per poll, so h2h-only at
-  # 10 min costs 6 credits/hour. Fri 11pm -> Mon midnight is ~73h = ~438
-  # credits, inside a 500/month quota with headroom. 300s would burn 876.
-  # Run ODDS_API_MARKETS=h2h (see .env.example); the default
-  # h2h,spreads,totals costs 3 credits/poll.
+  # 600s: the Odds API charges ~1 credit per poll with an explicit
+  # bookmaker list and h2h only (the bookmakers parameter takes priority
+  # over regions; the x-requests-last value on the first poll confirms
+  # it). Fri 11pm -> Mon midnight is ~73h = ~438 credits at 600s, inside
+  # a 500/month quota with headroom. If #ops shows used 2+ per poll,
+  # raise this before Saturday night.
   sportsbook_interval_s: 600
   discovery_interval_s: 3600
+  # Below 100 remaining credits: one loud #ops alert, and sportsbook
+  # polls slow to every 30 min until the balance recovers.
+  credit_reserve: 100
+  credit_reserve_interval_s: 1800
 
 pricing:
   devig_method: power
@@ -21,6 +26,8 @@ pricing:
   # ADR-0011: NFL tie rate for the moneyline tie adjustment.
   nfl_tie_prob: 0.004
   nfl_tie_prob_se: 0.003
+  # Weights apply only to books in ODDS_API_BOOKMAKERS; a weight for a
+  # book not on the list (e.g. circa, unless added) is simply unused.
   book_weights:
     pinnacle: 3.0
     circa: 3.0

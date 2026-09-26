@@ -1,10 +1,10 @@
 # ADR-0011: NFL moneylines: the tie refund is an adjustable terms difference
 
 Date: 2026-09-25
-Status: Accepted. Implementation: implemented (2026-09-26). The week-4
-blocker is resolved: all 15 NFL moneyline listings in
-`deploy/config.week4.yaml` now price through the tie adjustment, and the
-live tick path, closing-line capture, and config all carry it.
+Status: Accepted. Implementation: complete (`ebfdf17`). Verified end to end
+against `deploy/config.week4.yaml`: a −200/+170 book pair produces a
+tie-adjusted fair value (0.6482, method `power-devig+tie-adj`) for the
+Kalshi BUF moneyline listing, which previously had none.
 
 ## Context
 
@@ -72,3 +72,16 @@ this applies the same pattern.
   periods.
 - The closing-line pairing forms for an NFL moneyline under the rule and
   produces the converted value.
+
+## Implementation notes (`ebfdf17`)
+
+- `application/tie.py` holds the rule. `find_tie_adjusted_fair` is the live
+  path, and `tie_close_basis` / `tie_aware_counterpart` handle closing lines.
+- Closing lines pair the yes basis with the book's "home margin ≤ −1" only
+  under this rule, convert with (1 − t), and flip once for No-side listings.
+- `pricing.nfl_tie_prob` and `pricing.nfl_tie_prob_se` are config values on
+  the model.
+- **Follow-up (done):** `values_by_terms` now returns the `Terms` for each
+  partition alongside its fair values, so the rule reads the book's refund
+  terms from the object instead of parsing the `terms_key` string back.
+  `parse_terms_key` is removed.

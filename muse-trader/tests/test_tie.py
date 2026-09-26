@@ -83,7 +83,27 @@ def test_no_fair_value_without_the_rule():
     model = WeightedConsensusModel(method="power")
     fair_by_terms = model.values_by_terms(priced, NOW)
     yes_home = moneyline(GAME, KC)
-    assert fair_by_terms.get(_listing_terms_key(yes_home), {}).get(yes_home) is None
+    partition = fair_by_terms.get(_listing_terms_key(yes_home))
+    assert partition is None or partition[1].get(yes_home) is None
+
+
+def test_partition_carries_terms_without_key_parsing():
+    """values_by_terms returns each partition's Terms alongside its values.
+
+    The tie rule reads the book's refund terms from the object, not by
+    parsing the terms key string back apart. Each side's partition carries
+    its own refund outcome.
+    """
+    priced = [_book_priced("draftkings", KC, -150), _book_priced("draftkings", BUF, 130)]
+    model = WeightedConsensusModel(method="power")
+    fair_by_terms = model.values_by_terms(priced, NOW)
+    yes_home = moneyline(GAME, KC)
+    yes_away = moneyline(GAME, BUF)
+    by_refund = {
+        terms.payoff.refunds_if: by_outcome for terms, by_outcome in fair_by_terms.values()
+    }
+    assert by_refund[margin_exactly(GAME, KC, Decimal(0))][yes_home].probability.value > 0
+    assert by_refund[margin_exactly(GAME, BUF, Decimal(0))][yes_away].probability.value > 0
 
 
 def test_tie_conversion_sums_with_tie():

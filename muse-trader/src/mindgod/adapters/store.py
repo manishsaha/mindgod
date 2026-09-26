@@ -8,7 +8,7 @@ reconstruct what we knew at any moment for honest backtests and CLV.
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from mindgod.application.calls import (
@@ -135,6 +135,14 @@ class Store(ObservationStore):
                  source TEXT NOT NULL,
                  captured_at TEXT NOT NULL,
                  method_version INTEGER NOT NULL DEFAULT 1)"""
+        )
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS closing_line_terminal(
+                 outcome_key TEXT NOT NULL,
+                 reason TEXT NOT NULL,
+                 marked_at TEXT NOT NULL,
+                 method_version INTEGER NOT NULL,
+                 PRIMARY KEY (outcome_key, method_version))"""
         )
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS settlements(
@@ -427,6 +435,41 @@ class Store(ObservationStore):
         """
         row = self._conn.execute(
             "SELECT 1 FROM closing_lines WHERE outcome_key = ? AND method_version = ? LIMIT 1",
+            (outcome_key, CLOSING_LINE_METHOD_VERSION),
+        ).fetchone()
+        return row is not None
+
+    def record_closing_line_terminal(
+        self, outcome_key: str, reason: str, marked_at: datetime | None = None
+    ) -> None:
+        """Mark a closing line as never computable, so capture stops retrying.
+
+        Called when a started event's close cannot be computed and its call
+        has already settled: no future loop can produce a close (the
+        pre-kickoff quote history is fixed), so retrying every loop is pure
+        waste. Version-aware like the closes themselves: a new method
+        version retries once, in case the new method can compute it.
+        Append-only: INSERT OR IGNORE keeps the first mark per version, so
+        the row stays auditable after the method moves on.
+        """
+        at = marked_at or datetime.now(UTC)
+        self._conn.execute(
+            "INSERT OR IGNORE INTO closing_line_terminal"
+            " (outcome_key, reason, marked_at, method_version) VALUES (?, ?, ?, ?)",
+            (
+                outcome_key,
+                reason,
+                at.isoformat(),
+                CLOSING_LINE_METHOD_VERSION,
+            ),
+        )
+        self._conn.commit()
+
+    def closing_line_terminal(self, outcome_key: str) -> bool:
+        """Whether this outcome's close was marked terminally unavailable."""
+        row = self._conn.execute(
+            "SELECT 1 FROM closing_line_terminal WHERE outcome_key = ?"
+            " AND method_version = ? LIMIT 1",
             (outcome_key, CLOSING_LINE_METHOD_VERSION),
         ).fetchone()
         return row is not None

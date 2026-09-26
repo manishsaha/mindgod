@@ -4,10 +4,16 @@
 
 polling:
   exchange_interval_s: 60
-  # The Odds API bills per request (markets x regions), so sportsbooks refresh
-  # on their own slower cadence. Discovery only feeds the review queue.
+  # The Odds API bills per request (1 credit per poll with an explicit
+  # bookmaker list and h2h only), so sportsbooks refresh on their own
+  # slower cadence. Discovery only feeds the review queue.
   sportsbook_interval_s: 300
   discovery_interval_s: 3600
+  # Credit reserve: below this many remaining credits, #ops gets one loud
+  # LOW CREDITS alert and sportsbook polls slow to
+  # credit_reserve_interval_s until the balance recovers.
+  credit_reserve: 100
+  credit_reserve_interval_s: 1800
 
 pricing:
   devig_method: power  # additive | multiplicative | power (Shin: planned)

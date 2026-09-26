@@ -23,6 +23,7 @@ def _env(tmp_path, monkeypatch):
     monkeypatch.setenv("DISCORD_WEBHOOK_OPS", "https://discord.test/ops")
     monkeypatch.delenv("ODDS_API_MARKETS", raising=False)
     monkeypatch.delenv("ODDS_API_REGIONS", raising=False)
+    monkeypatch.delenv("ODDS_API_BOOKMAKERS", raising=False)
     monkeypatch.delenv("MINDGOD_SOFT_STARTUP", raising=False)
 
 
@@ -50,6 +51,19 @@ def test_odds_regions_env_override(_env, monkeypatch):
     ctx, _ = build_context(str(WEEK4), Decimal("10000"), False)
     assert ctx.sportsbook is not None
     assert ctx.sportsbook._regions == "us"
+
+
+def test_odds_bookmakers_default(_env):
+    ctx, _ = build_context(str(WEEK4), Decimal("10000"), False)
+    assert ctx.sportsbook is not None
+    assert ctx.sportsbook._bookmakers == "draftkings,fanduel,pinnacle"
+
+
+def test_odds_bookmakers_env_override(_env, monkeypatch):
+    monkeypatch.setenv("ODDS_API_BOOKMAKERS", "pinnacle,circa")
+    ctx, _ = build_context(str(WEEK4), Decimal("10000"), False)
+    assert ctx.sportsbook is not None
+    assert ctx.sportsbook._bookmakers == "pinnacle,circa"
 
 
 def test_missing_odds_key_fails_loudly(_env, monkeypatch):

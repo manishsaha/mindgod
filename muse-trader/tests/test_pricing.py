@@ -82,7 +82,7 @@ def test_model_builds_fair_value_with_lineage():
     model = WeightedConsensusModel()
     values = model.values_by_terms(priced, NOW)
     assert len(values) == 1
-    values = next(iter(values.values()))
+    _, values = next(iter(values.values()))
     kc = moneyline(GAME, KC)
     assert abs(values[kc].probability.value - 0.5) < 1e-6
     assert values[kc].standard_error == 0.0
@@ -100,7 +100,7 @@ def test_model_weights_sharp_books_and_measures_disagreement():
     model = WeightedConsensusModel(book_weights={"pinnacle": 3.0})
     values = model.values_by_terms(priced, NOW)
     assert len(values) == 1
-    values = next(iter(values.values()))
+    _, values = next(iter(values.values()))
     kc = moneyline(GAME, KC)
     fair = values[kc].probability.value
     assert 0.5 < fair < 0.6  # sharp book pulls consensus toward 0.5
@@ -115,7 +115,7 @@ def test_min_standard_error_floors_single_book_certainty():
     model = WeightedConsensusModel(min_standard_error=0.02)
     values = model.values_by_terms(priced, NOW)
     assert len(values) == 1
-    values = next(iter(values.values()))
+    _, values = next(iter(values.values()))
     kc = moneyline(GAME, KC)
     assert values[kc].standard_error == 0.02
 
@@ -179,7 +179,7 @@ def test_underdog_push_terms_match_favorite():
     model = WeightedConsensusModel()
     values = model.values_by_terms(priced, NOW)
     assert len(values) == 1
-    fair = next(iter(values.values()))
+    _, fair = next(iter(values.values()))
     kc = spread(GAME, KC, Decimal("-3"))
     buf = spread(GAME, BUF, Decimal("3"))
     assert abs(fair[kc].probability.value - 0.5) < 1e-6
@@ -264,7 +264,7 @@ def test_quote_age_widens_standard_error():
             )
     model = WeightedConsensusModel(stale_se_per_minute=0.001)
     values = model.values_by_terms(priced, NOW)
-    fair = next(iter(values.values()))
+    _, fair = next(iter(values.values()))
     kc = moneyline(GAME, KC)
     # 10 minutes stale at 0.001/min beats the zero disagreement floor.
     assert fair[kc].standard_error == 0.01
@@ -293,7 +293,7 @@ def test_age_term_combines_in_quadrature_with_production_floor():
             )
     model = WeightedConsensusModel(min_standard_error=0.02, stale_se_per_minute=0.001)
     values = model.values_by_terms(priced, NOW)
-    fair = next(iter(values.values()))
+    _, fair = next(iter(values.values()))
     kc = moneyline(GAME, KC)
     expected = math.sqrt(0.02**2 + 0.015**2)
     assert abs(fair[kc].standard_error - expected) < 1e-9

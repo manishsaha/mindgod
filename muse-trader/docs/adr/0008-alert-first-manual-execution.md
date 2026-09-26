@@ -116,7 +116,12 @@ with no closing line is left ungraded (not graded with CLV None) and shows
 up in the exclusion breakdown as "no close". Closing-line capture has no
 one-hour window: it fills in any started event missing a close at the
 current version, reading stored history as of kickoff, so late capture
-after a restart computes the same value.
+after a restart computes the same value. A started event whose close can
+never be computed (e.g. no pre-kickoff quotes were ever stored) is marked
+terminally unavailable in `closing_line_terminal` once its call settles;
+later loops skip it instead of retrying forever. The mark is version-aware
+(primary key `(outcome_key, method_version)`, append-only), so a new
+method version retries once.
 
 ## Data model
 

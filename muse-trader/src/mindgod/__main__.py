@@ -92,13 +92,21 @@ def build_context(
     # listings only ever look up h2h outcomes, so a moneyline-only deployment
     # can safely run h2h-only.
     odds_markets = os.environ.get("ODDS_API_MARKETS", "h2h,spreads,totals")
-    # ODDS_API_REGIONS controls credit burn and Pinnacle coverage: Pinnacle
-    # is a eu-region book, so regions=us alone never returns it. Whether the
-    # eu leg costs extra credits is settled by the x-requests-last header,
-    # reported to #ops after every poll.
+    # ODDS_API_BOOKMAKERS is the pricing universe: the weights in
+    # pricing.book_weights only apply to books on this list. The API treats
+    # an explicit bookmaker list as an alternative to regions, so
+    # ODDS_API_REGIONS is effectively ignored while this is set; requested
+    # books come from any region (Pinnacle is requested by key, which is
+    # why it is returned despite being a eu-region book).
+    odds_bookmakers = os.environ.get("ODDS_API_BOOKMAKERS", "draftkings,fanduel,pinnacle")
     odds_regions = os.environ.get("ODDS_API_REGIONS", "us,eu")
     sportsbook = (
-        OddsApiSource(api_key=odds_key, markets=odds_markets, regions=odds_regions)
+        OddsApiSource(
+            api_key=odds_key,
+            markets=odds_markets,
+            regions=odds_regions,
+            bookmakers=odds_bookmakers,
+        )
         if odds_key
         else None
     )
@@ -189,6 +197,8 @@ def main() -> None:
             exchange_interval_s=polling.exchange_interval_s,
             sportsbook_interval_s=polling.sportsbook_interval_s,
             discovery_interval_s=polling.discovery_interval_s,
+            credit_reserve=polling.credit_reserve,
+            credit_reserve_interval_s=polling.credit_reserve_interval_s,
         )
     )
 

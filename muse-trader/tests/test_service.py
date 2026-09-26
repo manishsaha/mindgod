@@ -225,7 +225,11 @@ def test_matching_terms_flow_through():
     detector = DetectingDetector()
     key = terms_key(Terms(Payoff(outcome, push)))
     ctx = _context(
-        listing, event, [_book(listing.key)], FakeModel({key: {outcome: fair}}), detector
+        listing,
+        event,
+        [_book(listing.key)],
+        FakeModel({key: (Terms(Payoff(outcome, push)), {outcome: fair})}),
+        detector,
     )
     opps = asyncio.run(tick(ctx, priced))
     assert len(opps) == 1
@@ -319,7 +323,8 @@ def _fair_for(listing, event):
         method="test",
         sources=(),
     )
-    return priced, {terms_key(Terms(Payoff(outcome, push))): {outcome: fair}}
+    terms = Terms(Payoff(outcome, push))
+    return priced, {terms_key(terms): (terms, {outcome: fair})}
 
 
 def test_move_check_suppresses_move_away_from_fair():
@@ -464,3 +469,48 @@ def test_mlb_moneyline_emitted_with_unknown_pitcher_rule():
     assert len(parsed) == 2
     for priced in parsed:
         assert priced.terms.void_policy.pitcher_rule == PitcherRule.UNKNOWN
+
+
+def _quota(remaining):
+    from mindgod.application.ports import QuotaStatus
+
+    return QuotaStatus(used=1, remaining=remaining, bookmakers=("pinnacle",))
+
+
+def _slowdown(quota, already_alerted):
+    from mindgod.application.service import _credit_slowdown
+
+    return _credit_slowdown(
+        quota,
+        reserve=100,
+        normal_interval_s=600,
+        slow_interval_s=1800,
+        already_alerted=already_alerted,
+    )
+
+
+def test_credit_slowdown_keeps_normal_interval_above_reserve():
+    interval, alert, latched = _slowdown(_quota(491), already_alerted=False)
+    assert (interval, alert, latched) == (600, None, False)
+
+
+def test_credit_slowdown_alerts_once_and_latches_below_reserve():
+    interval, alert, latched = _slowdown(_quota(99), already_alerted=False)
+    assert interval == 1800
+    assert latched is True
+    assert alert is not None
+    assert "LOW CREDITS" in alert and "99" in alert and "1800" in alert
+    # Second poll below the reserve: still slow, no repeat alert.
+    assert _slowdown(_quota(50), already_alerted=True) == (1800, None, True)
+
+
+def test_credit_slowdown_recovers_and_unlatches():
+    interval, alert, latched = _slowdown(_quota(500), already_alerted=True)
+    assert interval == 600
+    assert latched is False
+    assert alert is not None and "recovered" in alert
+
+
+def test_credit_slowdown_ignores_unknown_remaining():
+    interval, alert, latched = _slowdown(_quota(None), already_alerted=False)
+    assert (interval, alert, latched) == (600, None, False)

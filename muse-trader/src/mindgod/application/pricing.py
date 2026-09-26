@@ -32,7 +32,7 @@ from mindgod.domain.propositions import (
 )
 from mindgod.domain.sports import EventId, League, Period, PlayerId, TeamId
 from mindgod.domain.stats import Stat
-from mindgod.domain.terms import AbsenceRule, PostponementRule, Terms, VoidPolicy
+from mindgod.domain.terms import Terms
 from mindgod.domain.valuation import FairValue
 from mindgod.domain.venues import ListingKey, VenueId
 
@@ -130,38 +130,6 @@ def terms_key(terms: Terms) -> str:
             pitchers,
         ]
     )
-
-
-def parse_terms_key(key: str) -> tuple[Outcome | None, VoidPolicy] | None:
-    """Inverse of terms_key: the refund outcome and void policy a key was made from.
-
-    The refund outcome key is 9 pipe-joined parts (or "" when there is no
-    refund); the void policy is the 3 trailing parts. Returns None when the
-    key does not parse. The pitcher rule is not part of the key, so the
-    reconstructed policy carries the default.
-    """
-    parts = key.split("|")
-    if parts[0] == "":
-        refunds: Outcome | None = None
-        rest = parts[1:]
-    else:
-        if len(parts) < 9:
-            return None
-        refunds = parse_outcome_key("|".join(parts[:9]))
-        if refunds is None:
-            return None
-        rest = parts[9:]
-    if len(rest) != 3:
-        return None
-    try:
-        void = VoidPolicy(
-            on_player_absent=AbsenceRule(rest[0]),
-            on_postponement=PostponementRule(rest[1]),
-            listed_pitchers=frozenset(PlayerId(p) for p in rest[2].split(",") if p),
-        )
-    except ValueError:
-        return None
-    return refunds, void
 
 
 def partition_by_terms(
@@ -372,20 +340,28 @@ class WeightedConsensusModel:
 
     def values_by_terms(
         self, priced: list[PricedOutcome], as_of: datetime
-    ) -> dict[str, dict[Outcome, FairValue]]:
-        """Fair values keyed by terms key, then outcome.
+    ) -> dict[str, tuple[Terms, dict[Outcome, FairValue]]]:
+        """Fair values keyed by terms key, then outcome, with the Terms.
 
         Devigging already ran per market group, so each partition only does
         the cross-book consensus: a push-refunding whole-number line never
-        informs a no-push listing's fair value.
+        informs a no-push listing's fair value. The partition's Terms travel
+        alongside the values so rules that need the book's refund terms
+        (ADR-0011) can read them directly instead of parsing the key string
+        back apart. The key determines refunds_if and the void policy
+        exactly, so the first Terms seen in the partition stands for all of
+        them for those fields.
         """
         devigged = devig_market_groups(
             priced, self._method, self._weight, as_of, self._max_quote_age_s
         )
         partitions: dict[str, list[DeviggedPrice]] = defaultdict(list)
+        partition_terms: dict[str, Terms] = {}
         for d in devigged:
-            partitions[terms_key(d.terms)].append(d)
-        result: dict[str, dict[Outcome, FairValue]] = {}
+            key = terms_key(d.terms)
+            partitions[key].append(d)
+            partition_terms.setdefault(key, d.terms)
+        result: dict[str, tuple[Terms, dict[Outcome, FairValue]]] = {}
         for key, bucket in partitions.items():
             by_outcome: dict[Outcome, list[DeviggedPrice]] = defaultdict(list)
             for d in bucket:
@@ -409,5 +385,5 @@ class WeightedConsensusModel:
                     method=f"{self._method}-devig",
                     sources=tuple(e.listing_key for e in entries),
                 )
-            result[key] = fair_values
+            result[key] = (partition_terms[key], fair_values)
         return result

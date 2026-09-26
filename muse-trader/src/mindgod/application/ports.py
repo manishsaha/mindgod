@@ -148,7 +148,14 @@ class ProbablePitcherSource(Protocol):
 class FairValueModel(Protocol):
     def values_by_terms(
         self, priced: list[PricedOutcome], as_of: datetime
-    ) -> dict[str, dict[Outcome, FairValue]]: ...
+    ) -> dict[str, tuple[Terms, dict[Outcome, FairValue]]]:
+        """Fair values keyed by terms key, with the partition's Terms.
+
+        The Terms travel alongside the values so rules that need the
+        book's refund terms (ADR-0011's tie conversion) can read them
+        directly instead of parsing the key string back apart.
+        """
+        ...
 
     def consensus(self, pairs: list[tuple[str, float]]) -> float:
         """Sharp-weighted average of (venue_id, probability) pairs.
@@ -203,6 +210,13 @@ class ObservationStore(Protocol):
     def record_closing_line(self, line: ClosingLine) -> None: ...
     def record_settlement(self, settlement: Settlement) -> None: ...
     def record_call_grade(self, grade: CallGrade) -> None: ...
+    # Closing line capture: a settled outcome whose close can never be
+    # computed is marked terminal so later loops stop retrying it. The
+    # reason (e.g. "no_quotes") is kept for the ops log.
+    def record_closing_line_terminal(
+        self, outcome_key: str, reason: str, marked_at: datetime | None = None
+    ) -> None: ...
+    def closing_line_terminal(self, outcome_key: str) -> bool: ...
     # Closing line capture: query historical quotes.
     # Each entry: (venue, price, valid_at, recorded_at). recorded_at is the
     # confirmation time; staleness gates on it per ADR-0007.

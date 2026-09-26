@@ -51,6 +51,7 @@ from .ports import (
     OpsPoster,
     PricedOutcome,
     ProbablePitcherSource,
+    QuotaStatus,
     SportsbookSource,
 )
 from .pricing import terms_key
@@ -161,6 +162,42 @@ def _report_quota(ctx: ServiceContext) -> None:
         ctx,
         f"Odds API poll: used {quota.used}, remaining {quota.remaining} (books: {books})",
     )
+
+
+def _credit_slowdown(
+    quota: QuotaStatus | None,
+    *,
+    reserve: int,
+    normal_interval_s: int,
+    slow_interval_s: int,
+    already_alerted: bool,
+) -> tuple[int, str | None, bool]:
+    """Effective sportsbook poll interval under the credit reserve.
+
+    When remaining credits drop below the reserve, slow polling to the
+    reserve interval and emit one loud #ops alert; the alert latches until
+    credits recover above the reserve, so a muted channel is not spammed
+    every poll. On recovery the normal interval is restored with a single
+    recovery note. Returns (effective_interval_s, alert_or_None, latched).
+    """
+    remaining = quota.remaining if quota is not None else None
+    if remaining is None or remaining >= reserve:
+        if already_alerted and remaining is not None:
+            return (
+                normal_interval_s,
+                f"Odds API credits recovered: {remaining} remaining;"
+                f" resuming {normal_interval_s}s sportsbook polls.",
+                False,
+            )
+        return normal_interval_s, None, False
+    if not already_alerted:
+        return (
+            slow_interval_s,
+            f"LOW CREDITS: {remaining} remaining (reserve {reserve})."
+            f" Slowing sportsbook polls to every {slow_interval_s}s until recovery.",
+            True,
+        )
+    return slow_interval_s, None, True
 
 
 def _mid_price(book: OrderBook) -> float | None:
@@ -477,7 +514,8 @@ async def tick(ctx: ServiceContext, priced: list[PricedOutcome]) -> list[Opportu
                     listing.terms.void_policy,
                 )
             )
-            fair = fair_by_terms.get(key, {}).get(yes_outcome)
+            partition = fair_by_terms.get(key)
+            fair = partition[1].get(yes_outcome) if partition is not None else None
             if fair is None:
                 # ADR-0011: the book's moneyline refunds on a tie while the
                 # listing settles No. Convert the tie-refunding consensus
@@ -710,6 +748,11 @@ def _close_for_outcome(
     return prob, "paired"
 
 
+def _settled_outcome_keys(ctx: ServiceContext) -> set[str]:
+    """Canonical outcome keys of calls that already have a settlement."""
+    return {ctx.store.canonical_outcome_key(s["outcome"]) for s in ctx.store.settled_calls()}
+
+
 def capture_closing_lines(
     ctx: ServiceContext,
     at: datetime,
@@ -736,13 +779,16 @@ def capture_closing_lines(
     line at the current method version. There is deliberately no one-hour
     window: the close reads stored history as of kickoff, so a late capture
     (e.g. after a restart during the first hour) computes the same value,
-    and a failed capture is retried on later loops.
+    and a failed capture is retried on later loops until the call settles;
+    a settled call whose close still cannot be computed is marked
+    terminally unavailable so it is not retried forever.
     Returns the number of closing lines captured.
     """
     from .calls import ClosingLine
     from .pricing import outcome_key
 
     n = 0
+    settled_keys: set[str] | None = None
     for listings in [ctx.resolver.listings_for(ex.venue_id) for ex in ctx.exchanges]:
         for listing in listings:
             start = ctx.resolver.event_start(listing.key)
@@ -759,6 +805,10 @@ def capture_closing_lines(
             okey = outcome_key(listing.outcome)
             if ctx.store.has_closing_line(okey):
                 continue
+            # Terminally unavailable at the current version: a settled call
+            # whose close could never be computed. Do not retry.
+            if ctx.store.closing_line_terminal(okey):
+                continue
 
             # Each side is looked up under its own key, so there's nothing
             # to flip: Yes and No listings get their own devigged
@@ -771,7 +821,7 @@ def capture_closing_lines(
             # mass on the No side.
             tie_basis = tie_close_basis(listing)
             basis = tie_basis if tie_basis is not None else listing.outcome
-            prob, _reason = _close_for_outcome(
+            prob, reason = _close_for_outcome(
                 ctx.store,
                 ctx.model,
                 basis,
@@ -779,6 +829,18 @@ def capture_closing_lines(
                 tie_prob=ctx.model.nfl_tie_prob if tie_basis is not None else None,
             )
             if prob is None:
+                # The pre-kickoff quote history is fixed, so a close that
+                # cannot be computed now can never be computed later. Once
+                # the call has settled, mark it terminal so later loops stop
+                # retrying; before settlement, keep retrying in case quotes
+                # arrive late (e.g. after a restart during the first hour).
+                if settled_keys is None:
+                    settled_keys = _settled_outcome_keys(ctx)
+                if okey in settled_keys:
+                    try:
+                        ctx.store.record_closing_line_terminal(okey, reason, at)
+                    except Exception:
+                        log.exception("record_closing_line_terminal failed for %s", listing.key)
                 continue
             if tie_basis is not None and listing.key.side == "no":
                 prob = 1.0 - prob
@@ -1058,14 +1120,23 @@ async def run_forever(
     exchange_interval_s: int = 60,
     sportsbook_interval_s: int = 300,
     discovery_interval_s: int = 3600,
+    credit_reserve: int = 100,
+    credit_reserve_interval_s: int = 1800,
 ) -> None:
     priced: list[PricedOutcome] = []
     last_sportsbook = 0.0
     last_discovery = 0.0
+    # The credit reserve can slow sportsbook polling below the configured
+    # interval; the alert latches until credits recover.
+    effective_sportsbook_interval = sportsbook_interval_s
+    reserve_alerted = False
     while True:
         try:
             now_ts = time.monotonic()
-            if ctx.sportsbook is not None and now_ts - last_sportsbook >= sportsbook_interval_s:
+            if (
+                ctx.sportsbook is not None
+                and now_ts - last_sportsbook >= effective_sportsbook_interval
+            ):
                 try:
                     priced = await ctx.sportsbook.priced_outcomes()
                     ctx.sportsbook_refreshed = True
@@ -1114,6 +1185,22 @@ async def run_forever(
                     _post_ops(ctx, "Odds API poll failed; keeping stale prices.")
                 else:
                     _report_quota(ctx)
+                    # Credit reserve: slow down automatically when the
+                    # remaining balance drops below the reserve, with one
+                    # loud #ops alert until it recovers.
+                    (
+                        effective_sportsbook_interval,
+                        reserve_alert,
+                        reserve_alerted,
+                    ) = _credit_slowdown(
+                        ctx.sportsbook.quota_status(),
+                        reserve=credit_reserve,
+                        normal_interval_s=sportsbook_interval_s,
+                        slow_interval_s=credit_reserve_interval_s,
+                        already_alerted=reserve_alerted,
+                    )
+                    if reserve_alert is not None:
+                        _post_ops(ctx, reserve_alert)
             opps = await tick(ctx, priced)
             if now_ts - last_discovery >= discovery_interval_s:
                 await _discover(ctx)

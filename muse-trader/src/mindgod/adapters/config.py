@@ -70,6 +70,11 @@ class PollingConfig:
     sportsbook_interval_s: int = 300
     # Discovery only feeds the human review queue; it never trades.
     discovery_interval_s: int = 3600
+    # Credit reserve: when the Odds API reports fewer remaining credits
+    # than this, the service posts a loud #ops alert and slows sportsbook
+    # polls to credit_reserve_interval_s until credits recover.
+    credit_reserve: int = 100
+    credit_reserve_interval_s: int = 1800
 
 
 @dataclass(frozen=True, slots=True)
